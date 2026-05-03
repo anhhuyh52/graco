@@ -191,17 +191,35 @@ const DEFAULT_EXPOSURE_POINTS = [
 
 const DEFAULT_CONTRAST_POINTS = [
   [0, 0],
+  [0.167, 0.167],
   [0.333, 0.333],
-  [0.667, 0.667],
+  [0.833, 0.833],
   [1, 1],
 ];
 
-const defaultHueCurve = (n = 6): Curve => ({
-  points: Array.from({ length: n }, (_, i) => ({ x: i / n, y: 0.5 })),
-  interpolation: "Bezier",
-  master: 0,
-  pointCount: n,
-});
+const DEFAULT_HUE_CURVE_POINTS = [
+  [0, 0.5],
+  [0.167, 0.5],
+  [0.333, 0.5],
+  [0.583, 0.5],
+  [0.805, 0.5],
+  [1, 0.5],
+];
+
+const DEFAULT_CHROMA_POINTS = [
+  [0, 0.5],
+  [0.333, 0.5],
+  [0.667, 0.5],
+  [1, 0.5],
+];
+
+const DEFAULT_SATURATION_POINTS = [
+  [0, 0.5],
+  [0.25, 0.5],
+  [0.5, 0.5],
+  [0.75, 0.5],
+  [1, 0.5],
+];
 
 export const createDefaultEditState = (): EditState => ({
   inputColorSpace: "sRGB",
@@ -234,10 +252,10 @@ export const createDefaultEditState = (): EditState => ({
     threshold: 0.5,
     bypass: false,
   },
-  density: { curve: defaultHueCurve(6), bypass: false },
-  chroma: { curve: defaultCurve(5), bypass: false },
-  radiance: { curve: defaultHueCurve(6), bypass: false },
-  saturation: { curve: defaultCurve(5), bypass: false },
+  density: { curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"), bypass: false },
+  chroma: { curve: curveFromPoints(DEFAULT_CHROMA_POINTS, "Cubic"), bypass: false },
+  radiance: { curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"), bypass: false },
+  saturation: { curve: curveFromPoints(DEFAULT_SATURATION_POINTS, "Bezier"), bypass: false },
   rgb: {
     shadowR: 0,
     shadowG: 0,
@@ -575,7 +593,11 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
   // Now: clone → apply updater → immutable project update → GPU push.
   const setEdit = (updater: (state: EditState) => void, label = "Edit") => {
     const media = activeMedia();
-    if (!media) return;
+    if (!media) {
+      createProject("Untitled Project");
+      queueMicrotask(() => setEdit(updater, label));
+      return;
+    }
 
     // Clone first so the updater mutates a fresh object, not the live state
     const next = structuredClone(media.editState);
@@ -729,6 +751,12 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
 
   // ─── Keyboard shortcuts ─────────────────────────────────────────────────────
   onMount(() => {
+    // Keep controls interactive even before importing any image by ensuring
+    // there is always an active project/media target for setEdit().
+    if (!activeProjectId() || !activeMedia()) {
+      createProject("Untitled Project");
+    }
+
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
       if (tag === "input" || tag === "textarea") return;

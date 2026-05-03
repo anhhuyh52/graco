@@ -1,4 +1,4 @@
-import { createSignal, Show, For } from "solid-js";
+import { Show, For } from "solid-js";
 import { useColorIO } from "../../context/ColorIOContext";
 
 // ─── Sub-components ────────────────────────────────────────────────────────────
@@ -151,38 +151,75 @@ function PointPad(props: {
   y: number;
   xLabel?: string;
   yLabel?: string;
+  variant?: "default" | "balance-left" | "balance-right";
   onChange: (point: { x: number; y: number }) => void;
 }) {
   let padRef: HTMLDivElement | undefined;
+  let dragging = false;
 
-  const updateFromEvent = (e: PointerEvent) => {
+  const updateFromClient = (clientX: number, clientY: number) => {
     if (!padRef) return;
     const rect = padRef.getBoundingClientRect();
-    const x = Math.max(-1, Math.min(1, ((e.clientX - rect.left) / rect.width) * 2 - 1));
-    const y = Math.max(-1, Math.min(1, 1 - ((e.clientY - rect.top) / rect.height) * 2));
+    const x = Math.max(
+      -1,
+      Math.min(1, ((clientX - rect.left) / rect.width) * 2 - 1),
+    );
+    const y = Math.max(
+      -1,
+      Math.min(1, 1 - ((clientY - rect.top) / rect.height) * 2),
+    );
     props.onChange({ x, y });
   };
 
-  const angle = () => Math.floor((Math.atan2(props.y, props.x) * 180) / Math.PI);
-  const distance = () => Math.round(100 * Math.sqrt(props.x * props.x + props.y * props.y));
+  const startDrag = (clientX: number, clientY: number) => {
+    dragging = true;
+    updateFromClient(clientX, clientY);
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!dragging) return;
+      updateFromClient(ev.clientX, ev.clientY);
+    };
+    const onMouseUp = () => {
+      dragging = false;
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onTouchEnd);
+      window.removeEventListener("touchcancel", onTouchEnd);
+    };
+    const onTouchMove = (ev: TouchEvent) => {
+      if (!dragging) return;
+      const t = ev.touches[0];
+      if (!t) return;
+      ev.preventDefault();
+      updateFromClient(t.clientX, t.clientY);
+    };
+    const onTouchEnd = () => onMouseUp();
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onTouchEnd);
+    window.addEventListener("touchcancel", onTouchEnd);
+  };
 
   return (
     <div class="point-control">
       <div class="point-readout">
         <span>{props.label}</span>
-        <span>
-          H: {angle()}° S: {distance()}%
-        </span>
       </div>
       <div
         ref={padRef}
-        class="point-pad"
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          updateFromEvent(e);
+        class={`point-pad ${props.variant ?? "default"}`}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          startDrag(e.clientX, e.clientY);
         }}
-        onPointerMove={(e) => {
-          if (e.currentTarget.hasPointerCapture(e.pointerId)) updateFromEvent(e);
+        onTouchStart={(e) => {
+          const t = e.touches[0];
+          if (!t) return;
+          e.preventDefault();
+          startDrag(t.clientX, t.clientY);
         }}
       >
         <div class="point-axis x" />
@@ -195,33 +232,393 @@ function PointPad(props: {
           }}
         />
       </div>
-      <div class="point-labels">
-        <span>{props.xLabel ?? "X"} {props.x.toFixed(2)}</span>
-        <span>{props.yLabel ?? "Y"} {props.y.toFixed(2)}</span>
-      </div>
     </div>
   );
 }
 
+const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
+
+const curveSvgPoint = (point: { x: number; y: number }) =>
+  `${clampUnit(point.x) * 100} ${(1 - clampUnit(point.y)) * 100}`;
+
+const averageCurveY = (points: { x: number; y: number }[]) =>
+  points.length
+    ? points.reduce((sum, point) => sum + clampUnit(point.y), 0) / points.length
+    : 0.5;
+
+const interpolationIcon = (interpolation: string) => {
+  const mode = interpolation.trim().toLowerCase();
+  if (mode === "bezier") return "/assets/icons/bezier_icon.svg";
+  if (mode === "linear") return "/assets/icons/linear_icon.svg";
+  return "/assets/icons/cubic_icon.svg";
+};
+
+const capitalizedInterpolation = (interpolation: string) => {
+  const mode = interpolation.trim().toLowerCase() || "cubic";
+  return mode.charAt(0).toUpperCase() + mode.slice(1);
+};
+
+function normalizedCurvePoints(points: { x: number; y: number }[]) {
+  const sorted = [...points]
+    .map((p) => ({ x: clampUnit(p.x), y: clampUnit(p.y) }))
+    .sort((a, b) => a.x - b.x);
+
+  return sorted.filter((point, index, arr) => {
+    const next = arr[index + 1];
+    return !next || Math.abs(point.x - next.x) > 0.0001;
+  });
+}
+
+function linearCurvePath(points: { x: number; y: number }[]) {
+  return points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${curveSvgPoint(point)}`)
+    .join(" ");
+}
+
+function bezierCurvePath(points: { x: number; y: number }[]) {
+  if (points.length < 2) return "";
+  let path = `M ${curveSvgPoint(points[0])}`;
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const prev = points[i - 1] ?? points[i];
+    const current = points[i];
+    const next = points[i + 1];
+    const after = points[i + 2] ?? next;
+    const c1 = {
+      x: current.x + (next.x - prev.x) / 6,
+      y: current.y + (next.y - prev.y) / 6,
+    };
+    const c2 = {
+      x: next.x - (after.x - current.x) / 6,
+      y: next.y - (after.y - current.y) / 6,
+    };
+
+    path += ` C ${curveSvgPoint(c1)} ${curveSvgPoint(c2)} ${curveSvgPoint(next)}`;
+  }
+
+  return path;
+}
+
+function cubicSplinePath(points: { x: number; y: number }[]) {
+  if (points.length < 3) return linearCurvePath(points);
+
+  const n = points.length;
+  const a = points.map((p) => p.y);
+  const h = Array.from({ length: n - 1 }, (_, i) =>
+    Math.max(0.0001, points[i + 1].x - points[i].x),
+  );
+  const alpha = Array(n).fill(0);
+
+  for (let i = 1; i < n - 1; i += 1) {
+    alpha[i] =
+      (3 / h[i]) * (a[i + 1] - a[i]) - (3 / h[i - 1]) * (a[i] - a[i - 1]);
+  }
+
+  const l = Array(n).fill(1);
+  const mu = Array(n).fill(0);
+  const z = Array(n).fill(0);
+  const c = Array(n).fill(0);
+  const b = Array(n - 1).fill(0);
+  const d = Array(n - 1).fill(0);
+
+  for (let i = 1; i < n - 1; i += 1) {
+    l[i] = 2 * (points[i + 1].x - points[i - 1].x) - h[i - 1] * mu[i - 1];
+    mu[i] = h[i] / l[i];
+    z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+  }
+
+  for (let j = n - 2; j >= 0; j -= 1) {
+    c[j] = z[j] - mu[j] * c[j + 1];
+    b[j] = (a[j + 1] - a[j]) / h[j] - (h[j] * (c[j + 1] + 2 * c[j])) / 3;
+    d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+  }
+
+  const samples: { x: number; y: number }[] = [];
+  for (let i = 0; i < n - 1; i += 1) {
+    const steps = Math.max(8, Math.round(h[i] * 80));
+    for (let step = 0; step <= steps; step += 1) {
+      if (i > 0 && step === 0) continue;
+      const x = points[i].x + (h[i] * step) / steps;
+      const dx = x - points[i].x;
+      samples.push({
+        x,
+        y: clampUnit(a[i] + b[i] * dx + c[i] * dx * dx + d[i] * dx * dx * dx),
+      });
+    }
+  }
+
+  return linearCurvePath(samples);
+}
+
+function evaluateLinearCurve(points: { x: number; y: number }[], x: number) {
+  if (!points.length) return 0.5;
+  if (x <= points[0].x) return points[0].y;
+  if (x >= points[points.length - 1].x) return points[points.length - 1].y;
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const left = points[i];
+    const right = points[i + 1];
+    if (x >= left.x && x <= right.x) {
+      const t = (x - left.x) / Math.max(0.0001, right.x - left.x);
+      return clampUnit(left.y + (right.y - left.y) * t);
+    }
+  }
+
+  return 0.5;
+}
+
+function evaluateBezierCurve(points: { x: number; y: number }[], x: number) {
+  if (points.length < 2) return points[0]?.y ?? 0.5;
+
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const prev = points[i - 1] ?? points[i];
+    const current = points[i];
+    const next = points[i + 1];
+    const after = points[i + 2] ?? next;
+
+    if (x < current.x || x > next.x) continue;
+
+    const c1 = {
+      x: current.x + (next.x - prev.x) / 6,
+      y: current.y + (next.y - prev.y) / 6,
+    };
+    const c2 = {
+      x: next.x - (after.x - current.x) / 6,
+      y: next.y - (after.y - current.y) / 6,
+    };
+
+    let lo = 0;
+    let hi = 1;
+    for (let step = 0; step < 18; step += 1) {
+      const t = (lo + hi) / 2;
+      const mt = 1 - t;
+      const bx =
+        mt * mt * mt * current.x +
+        3 * mt * mt * t * c1.x +
+        3 * mt * t * t * c2.x +
+        t * t * t * next.x;
+      if (bx < x) lo = t;
+      else hi = t;
+    }
+
+    const t = (lo + hi) / 2;
+    const mt = 1 - t;
+    return clampUnit(
+      mt * mt * mt * current.y +
+        3 * mt * mt * t * c1.y +
+        3 * mt * t * t * c2.y +
+        t * t * t * next.y,
+    );
+  }
+
+  return evaluateLinearCurve(points, x);
+}
+
+function evaluateCubicCurve(points: { x: number; y: number }[], x: number) {
+  if (points.length < 3) return evaluateLinearCurve(points, x);
+  if (x <= points[0].x) return points[0].y;
+  if (x >= points[points.length - 1].x) return points[points.length - 1].y;
+
+  const n = points.length;
+  const a = points.map((p) => p.y);
+  const h = Array.from({ length: n - 1 }, (_, i) =>
+    Math.max(0.0001, points[i + 1].x - points[i].x),
+  );
+  const alpha = Array(n).fill(0);
+
+  for (let i = 1; i < n - 1; i += 1) {
+    alpha[i] =
+      (3 / h[i]) * (a[i + 1] - a[i]) - (3 / h[i - 1]) * (a[i] - a[i - 1]);
+  }
+
+  const l = Array(n).fill(1);
+  const mu = Array(n).fill(0);
+  const z = Array(n).fill(0);
+  const c = Array(n).fill(0);
+  const b = Array(n - 1).fill(0);
+  const d = Array(n - 1).fill(0);
+
+  for (let i = 1; i < n - 1; i += 1) {
+    l[i] = 2 * (points[i + 1].x - points[i - 1].x) - h[i - 1] * mu[i - 1];
+    mu[i] = h[i] / l[i];
+    z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+  }
+
+  for (let j = n - 2; j >= 0; j -= 1) {
+    c[j] = z[j] - mu[j] * c[j + 1];
+    b[j] = (a[j + 1] - a[j]) / h[j] - (h[j] * (c[j + 1] + 2 * c[j])) / 3;
+    d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+  }
+
+  const segment = Math.max(
+    0,
+    Math.min(
+      n - 2,
+      points.findIndex(
+        (point, index) =>
+          index < n - 1 && x >= point.x && x <= points[index + 1].x,
+      ),
+    ),
+  );
+  const dx = x - points[segment].x;
+  return clampUnit(
+    a[segment] +
+      b[segment] * dx +
+      c[segment] * dx * dx +
+      d[segment] * dx * dx * dx,
+  );
+}
+
+function evaluateCurveY(
+  points: { x: number; y: number }[],
+  interpolation: string,
+  x: number,
+) {
+  const normalized = normalizedCurvePoints(points);
+  const mode = interpolation.trim().toLowerCase();
+  if (mode === "linear") return evaluateLinearCurve(normalized, clampUnit(x));
+  if (mode === "bezier") return evaluateBezierCurve(normalized, clampUnit(x));
+  return evaluateCubicCurve(normalized, clampUnit(x));
+}
+
+function curvePath(points: { x: number; y: number }[], interpolation: string) {
+  const normalized = normalizedCurvePoints(points);
+  if (!normalized.length) return "";
+  const mode = interpolation.trim().toLowerCase();
+  if (mode === "linear") return linearCurvePath(normalized);
+  if (mode === "bezier") return bezierCurvePath(normalized);
+  return cubicSplinePath(normalized);
+}
+
 function CurveEditor(props: {
   label: string;
-  curve: { points: { x: number; y: number }[]; interpolation: string; pointCount: number };
+  curve: {
+    points: { x: number; y: number }[];
+    interpolation: string;
+    pointCount: number;
+  };
   hueMode?: boolean;
   lineColor?: string;
+  identityReset?: boolean;
   onPointChange: (index: number, point: { x: number; y: number }) => void;
   onPointCountChange: (count: number) => void;
-  onInterpolationToggle: () => void;
+  onInterpolationChange: (next: string) => void;
+  onOffsetAll?: (deltaY: number) => void;
+  onReset?: () => void;
 }) {
-  const path = () =>
-    props.curve.points
-      .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * 100} ${(1 - p.y) * 100}`)
-      .join(" ");
+  let curveRef: HTMLDivElement | undefined;
+  let lastRollingTap = 0;
+  const rollingValue = () => averageCurveY(props.curve.points);
+
+  const EPSILON = 0.005;
+
+  const movePoint = (
+    index: number,
+    clientX: number,
+    clientY: number,
+    offsetX = 0,
+    offsetY = 0,
+    lockX = false,
+    lockY = false,
+  ) => {
+    if (!curveRef) return;
+    const rect = curveRef.getBoundingClientRect();
+    const current = props.curve.points[index];
+    const nx = lockX
+      ? current.x
+      : Math.max(0, Math.min(1, (clientX - rect.left - offsetX) / rect.width));
+    const ny = lockY
+      ? current.y
+      : Math.max(
+          0,
+          Math.min(1, 1 - (clientY - rect.top - offsetY) / rect.height),
+        );
+
+    const isFirst = index === 0;
+    const isLast = index === props.curve.points.length - 1;
+
+    if (isFirst) {
+      props.onPointChange(index, { x: 0, y: ny });
+      return;
+    }
+    if (isLast) {
+      props.onPointChange(index, { x: 1, y: ny });
+      return;
+    }
+
+    // Sort all points by x to find true neighbors in sorted order,
+    // regardless of their original array index
+    const sorted = props.curve.points
+      .map((p, i) => ({ ...p, origIndex: i }))
+      .sort((a, b) => a.x - b.x);
+    const sortedPos = sorted.findIndex((p) => p.origIndex === index);
+
+    const prevX = sortedPos > 0 ? sorted[sortedPos - 1].x : 0;
+    const nextX = sortedPos < sorted.length - 1 ? sorted[sortedPos + 1].x : 1;
+
+    const clampedX = Math.max(prevX + EPSILON, Math.min(nextX - EPSILON, nx));
+
+    props.onPointChange(index, { x: clampedX, y: ny });
+  };
+
+  const path = () => curvePath(props.curve.points, props.curve.interpolation);
 
   return (
     <div class="curve-editor">
-      <div class={`curve-box ${props.hueMode ? "hue" : ""}`}>
+      <div class="curve-side-left" title="Drag to move all points">
+        <div
+          class="rolling-surface"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const now = Date.now();
+            if (now - lastRollingTap > 0 && now - lastRollingTap < 500) {
+              props.onOffsetAll?.(0.5 - rollingValue());
+              lastRollingTap = 0;
+              return;
+            }
+            lastRollingTap = now;
+
+            const host = e.currentTarget;
+            const rect = host.getBoundingClientRect();
+            const startY = e.clientY;
+            const startPos = 1 - rollingValue();
+            let prevValue = rollingValue();
+            let didMove = false;
+
+            const onMove = (ev: PointerEvent) => {
+              didMove = true;
+              const dy = ev.clientY - startY;
+              const nextPos = Math.max(
+                0,
+                Math.min(1, startPos + dy / Math.max(1, rect.height)),
+              );
+              const nextValue = 1 - nextPos;
+              const delta = nextValue - prevValue;
+              prevValue = nextValue;
+              props.onOffsetAll?.(delta);
+            };
+            const onUp = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+              if (didMove) lastRollingTap = 0;
+            };
+
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp, { once: true });
+          }}
+        >
+          <div
+            class="rolling-indicator"
+            style={{ top: `${(1 - rollingValue()) * 100}%` }}
+          />
+        </div>
+      </div>
+      <div ref={curveRef} class={`curve-box ${props.hueMode ? "hue" : ""}`}>
         <svg viewBox="0 0 100 100" preserveAspectRatio="none">
-          <path d={path()} stroke={props.lineColor ?? "rgba(226,226,233,.85)"} />
+          <path
+            d={path()}
+            stroke={props.lineColor ?? "rgba(226,226,233,.85)"}
+          />
         </svg>
         <For each={props.curve.points}>
           {(point, index) => (
@@ -232,59 +629,105 @@ function CurveEditor(props: {
                 top: `${(1 - point.y) * 100}%`,
               }}
               title={`${props.label} point ${index() + 1}`}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                const rect = curveRef?.getBoundingClientRect();
+                const current = props.curve.points[index()];
+                const offsetX = rect
+                  ? e.clientX - (rect.left + current.x * rect.width)
+                  : 0;
+                const offsetY = rect
+                  ? e.clientY - (rect.top + (1 - current.y) * rect.height)
+                  : 0;
+                const lockedX =
+                  index() === 0 || index() === props.curve.points.length - 1;
+
+                const onMove = (ev: PointerEvent) =>
+                  movePoint(
+                    index(),
+                    ev.clientX,
+                    ev.clientY,
+                    offsetX,
+                    offsetY,
+                    lockedX || ev.altKey,
+                    ev.shiftKey,
+                  );
+                const onUp = () => {
+                  window.removeEventListener("pointermove", onMove);
+                  window.removeEventListener("pointerup", onUp);
+                };
+
+                window.addEventListener("pointermove", onMove);
+                window.addEventListener("pointerup", onUp, { once: true });
+              }}
+              onDblClick={(e) => {
+                e.preventDefault();
+                const current = props.curve.points[index()];
+                props.onPointChange(index(), {
+                  x: current.x,
+                  y: props.identityReset ? current.x : 0.5,
+                });
+              }}
             />
           )}
         </For>
       </div>
-      <div class="curve-point-list">
-        <For each={props.curve.points}>
-          {(point, index) => (
-            <div class="curve-point-row">
-              <span>{index() + 1}</span>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.001"
-                value={point.x}
-                onInput={(e) =>
-                  props.onPointChange(index(), {
-                    x: parseFloat(e.currentTarget.value),
-                    y: point.y,
-                  })
-                }
-              />
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.001"
-                value={point.y}
-                onInput={(e) =>
-                  props.onPointChange(index(), {
-                    x: point.x,
-                    y: parseFloat(e.currentTarget.value),
-                  })
-                }
-              />
-            </div>
-          )}
-        </For>
-      </div>
-      <div class="curve-actions">
-        <label>
-          Points
-          <input
-            type="number"
-            min="2"
-            max="7"
-            step="1"
-            value={props.curve.pointCount}
-            onInput={(e) => props.onPointCountChange(parseInt(e.currentTarget.value, 10))}
-          />
-        </label>
-        <button type="button" onClick={props.onInterpolationToggle}>
-          {props.curve.interpolation}
+      <div class="curve-side-right">
+        <div
+          class="curve-metric"
+          title="Drag to change number of curve points"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startCount = props.curve.pointCount;
+            let lastCount = startCount;
+
+            const onMove = (ev: PointerEvent) => {
+              const delta = Math.round((startY - ev.clientY) / 18);
+              const next = Math.max(2, Math.min(7, startCount + delta));
+              if (next !== lastCount) {
+                lastCount = next;
+                props.onPointCountChange(next);
+              }
+            };
+            const onUp = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+            };
+
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp, { once: true });
+          }}
+        >
+          <strong>{props.curve.pointCount}</strong>
+          <span>Points</span>
+        </div>
+        <button
+          type="button"
+          class="curve-control-button"
+          onClick={() => {
+            const current = props.curve.interpolation.toLowerCase();
+            const next =
+              current === "cubic"
+                ? "Bezier"
+                : current === "bezier"
+                  ? "Linear"
+                  : "Cubic";
+            props.onInterpolationChange(next);
+          }}
+          title="Click to change curve interpolation"
+        >
+          <img src={interpolationIcon(props.curve.interpolation)} alt="" />
+          <span>{capitalizedInterpolation(props.curve.interpolation)}</span>
+        </button>
+        <button
+          type="button"
+          class="curve-control-button"
+          onClick={() => props.onReset?.() ?? props.onPointCountChange(4)}
+          title="Reset curve points"
+        >
+          <img src="/assets/icons/reset_icon.svg" alt="" />
+          <span>Reset</span>
         </button>
       </div>
     </div>
@@ -379,44 +822,104 @@ export function Sidebar() {
   };
 
   const handlePanelBypass = (panel: keyof ReturnType<typeof editState>) => {
-    setEdit((s) => {
-      const section = s[panel] as any;
-      if (section && "bypass" in section) section.bypass = !section.bypass;
-    }, `${String(panel)} bypass`);
+    setEdit(
+      (s) => {
+        const section = s[panel] as any;
+        if (section && "bypass" in section) section.bypass = !section.bypass;
+      },
+      `${String(panel)} bypass`,
+    );
   };
 
   const handleCurvePointChange = (
-    panel: "exposure" | "contrast" | "density" | "chroma" | "radiance" | "saturation",
+    panel:
+      | "exposure"
+      | "contrast"
+      | "density"
+      | "chroma"
+      | "radiance"
+      | "saturation",
     index: number,
     point: { x: number; y: number },
   ) => {
     setEdit((s) => {
-      s[panel].curve.points[index] = point;
+      const points = s[panel].curve.points;
+      points[index] = point;
+      if (
+        (panel === "density" || panel === "radiance") &&
+        (index === 0 || index === points.length - 1)
+      ) {
+        const pairedIndex = index === 0 ? points.length - 1 : 0;
+        points[pairedIndex] = { ...points[pairedIndex], y: point.y };
+      }
     }, `${panel} curve`);
   };
 
   const handleCurvePointCount = (
-    panel: "exposure" | "contrast" | "density" | "chroma" | "radiance" | "saturation",
+    panel:
+      | "exposure"
+      | "contrast"
+      | "density"
+      | "chroma"
+      | "radiance"
+      | "saturation",
     count: number,
   ) => {
-    const nextCount = Math.max(2, Math.min(7, Number.isFinite(count) ? count : 2));
+    const nextCount = Math.max(
+      2,
+      Math.min(7, Math.round(Number.isFinite(count) ? count : 2)),
+    );
     setEdit((s) => {
-      const old = s[panel].curve.points;
-      s[panel].curve.points = Array.from({ length: nextCount }, (_, i) => {
-        if (old[i]) return old[i];
-        const x = i / (nextCount - 1);
-        return { x, y: panel === "density" || panel === "radiance" ? 0.5 : x };
+      const pts = [...s[panel].curve.points].sort((a, b) => a.x - b.x);
+      const first = pts[0] ?? { x: 0, y: 0.5 };
+      const last = pts[pts.length - 1] ?? { x: 1, y: 0.5 };
+      const span = last.x - first.x;
+      const nextPoints = Array.from({ length: nextCount }, (_, index) => {
+        if (index === 0) return { ...first };
+        if (index === nextCount - 1) return { ...last };
+        const x = clampUnit(first.x + (span * index) / (nextCount - 1));
+        return {
+          x,
+          y: evaluateCurveY(pts, s[panel].curve.interpolation, x),
+        };
       });
-      s[panel].curve.pointCount = nextCount;
+
+      s[panel].curve.points = nextPoints;
+      s[panel].curve.pointCount = nextPoints.length;
     }, `${panel} point count`);
   };
 
+  const handleCurveOffset = (
+    panel:
+      | "exposure"
+      | "contrast"
+      | "density"
+      | "chroma"
+      | "radiance"
+      | "saturation",
+    deltaY: number,
+  ) => {
+    if (!Number.isFinite(deltaY) || deltaY === 0) return;
+    setEdit((s) => {
+      s[panel].curve.points = s[panel].curve.points.map((p) => ({
+        x: p.x,
+        y: Math.max(0, Math.min(1, p.y + deltaY)),
+      }));
+    }, `${panel} offset`);
+  };
+
   const handleCurveInterpolation = (
-    panel: "exposure" | "contrast" | "density" | "chroma" | "radiance" | "saturation",
+    panel:
+      | "exposure"
+      | "contrast"
+      | "density"
+      | "chroma"
+      | "radiance"
+      | "saturation",
+    next: string,
   ) => {
     setEdit((s) => {
-      s[panel].curve.interpolation =
-        s[panel].curve.interpolation.toLowerCase() === "cubic" ? "Bezier" : "cubic";
+      s[panel].curve.interpolation = next;
     }, `${panel} interpolation`);
   };
 
@@ -432,10 +935,10 @@ export function Sidebar() {
     <aside class="sidebar">
       <style>{`
         .sidebar {
-          width: 280px;
+          width: clamp(360px, 32vw, 520px);
           flex-shrink: 0;
-          background: rgb(35, 35, 42);
-          border-left: 1px solid rgba(255,255,255,0.05);
+          background: linear-gradient(180deg, #1b1c25 0%, #171821 100%);
+          border-left: 1px solid rgba(255,255,255,0.06);
           display: flex;
           flex-direction: column;
           overflow: hidden;
@@ -473,7 +976,7 @@ export function Sidebar() {
         .panels-container {
           flex: 1;
           overflow-y: auto;
-          padding: 8px;
+          padding: 10px;
           scrollbar-width: thin;
           scrollbar-color: rgba(255,255,255,0.08) transparent;
         }
@@ -481,7 +984,11 @@ export function Sidebar() {
         .panels-container::-webkit-scrollbar-track { background: transparent; }
         .panels-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
         .panel-section {
-          margin-bottom: 4px;
+          margin-bottom: 6px;
+          border-radius: 12px;
+          background: rgba(255,255,255,0.02);
+          border: 1px solid rgba(255,255,255,0.04);
+          overflow: hidden;
         }
         .panel-section.bypassed .panel-content {
           opacity: 0.35;
@@ -489,14 +996,14 @@ export function Sidebar() {
         }
         .panel-header {
           width: 100%;
-          height: 36px;
-          padding: 0 12px;
+          height: 42px;
+          padding: 0 14px;
           display: flex;
           align-items: center;
           gap: 8px;
-          background: rgba(255,255,255,0.03);
+          background: rgba(255,255,255,0.025);
           border: none;
-          border-radius: 6px;
+          border-radius: 0;
           color: rgb(226, 226, 233);
           cursor: pointer;
           transition: background 120ms;
@@ -540,7 +1047,7 @@ export function Sidebar() {
           transform: rotate(180deg);
         }
         .panel-content {
-          padding: 12px;
+          padding: 14px;
           animation: slide-down 180ms ease-out;
           transition: opacity 120ms;
         }
@@ -552,10 +1059,10 @@ export function Sidebar() {
         /* ── Value slider ───────────────────────────────────────────────────── */
         .value-slider {
           display: grid;
-          grid-template-columns: 80px 1fr 40px;
+          grid-template-columns: 70px 1fr 42px;
           align-items: center;
-          gap: 8px;
-          margin-bottom: 10px;
+          gap: 10px;
+          margin-bottom: 12px;
         }
         .slider-label {
           font-size: 11px;
@@ -582,16 +1089,16 @@ export function Sidebar() {
         }
         .slider-track {
           width: 100%;
-          height: 4px;
+          height: 6px;
           background: rgba(255,255,255,0.08);
-          border-radius: 2px;
+          border-radius: 999px;
           overflow: hidden;
           pointer-events: none;
         }
         .slider-fill {
           height: 100%;
-          background: #4d8af0;
-          border-radius: 2px;
+          background: linear-gradient(90deg, #7e8fb0 0%, #4d8af0 100%);
+          border-radius: 999px;
           transition: width 30ms linear;
         }
         .slider-value {
@@ -618,13 +1125,13 @@ export function Sidebar() {
         .point-grid {
           display: grid;
           grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 10px;
+          gap: 12px;
         }
         .point-control {
           min-width: 0;
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 8px;
         }
         .point-readout,
         .point-labels {
@@ -636,18 +1143,26 @@ export function Sidebar() {
           font-variant-numeric: tabular-nums;
         }
         .point-readout span:first-child {
-          color: rgba(226, 226, 233, 0.75);
-          font-weight: 600;
+          color: rgba(226, 226, 233, 0.85);
+          font-weight: 700;
         }
         .point-pad {
           position: relative;
           aspect-ratio: 1;
-          border-radius: 8px;
-          background: rgba(255,255,255,0.04);
-          border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 9px;
+          background: radial-gradient(120% 120% at 80% 10%, rgba(106, 34, 67, 0.35), transparent 45%), linear-gradient(180deg, #2c3140 0%, #15172a 100%);
+          border: 1px solid rgba(255,255,255,0.15);
           overflow: hidden;
           cursor: crosshair;
           touch-action: none;
+        }
+        .point-pad.balance-left {
+          background: radial-gradient(90% 100% at 85% 20%, rgba(120, 20, 95, 0.38), transparent 42%), linear-gradient(145deg, #3f4552 0%, #14142b 72%);
+          border-color: rgba(227, 240, 255, 0.85);
+        }
+        .point-pad.balance-right {
+          background: radial-gradient(90% 100% at 85% 20%, rgba(201, 87, 37, 0.35), transparent 42%), radial-gradient(90% 100% at 30% 85%, rgba(25, 111, 39, 0.3), transparent 45%), linear-gradient(145deg, #33104e 0%, #0f2d1a 78%);
+          border-color: rgba(177, 255, 91, 0.7);
         }
         .point-axis {
           position: absolute;
@@ -668,16 +1183,18 @@ export function Sidebar() {
           pointer-events: none;
         }
         .curve-editor {
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
+          display: grid;
+          grid-template-columns: 36px minmax(0, 1fr) 64px;
+          gap: 12px;
+          align-items: stretch;
+          min-height: 240px;
         }
         .curve-box {
           position: relative;
-          height: 132px;
+          min-height: 240px;
           border-radius: 8px;
-          background: linear-gradient(135deg, #242424, #cccccc);
-          border: 1px solid rgba(255,255,255,0.08);
+          background: radial-gradient(circle at 10% 10%, rgba(255,255,255,0.08) 1px, transparent 1.4px) 0 0 / 32px 32px, #1a1b26;
+          border: 1px solid rgba(255,255,255,0.11);
           overflow: hidden;
         }
         .curve-box.hue {
@@ -696,53 +1213,78 @@ export function Sidebar() {
         }
         .curve-point {
           position: absolute;
-          width: 12px;
-          height: 12px;
+          width: 45px;
+          height: 45px;
           border-radius: 50%;
           background: rgb(226, 226, 233);
-          border: 2px solid rgb(35, 35, 42);
+          border: 15px solid transparent;
+          background-clip: padding-box;
           transform: translate(-50%, -50%);
           box-shadow: 0 2px 8px rgba(0,0,0,.35);
+          cursor: grab;
+          touch-action: none;
+          user-select: none;
         }
-        .curve-point-list {
+        .curve-point:active { cursor: grabbing; }
+        .curve-side-left {
+          position: relative;
+          border-radius: 8px;
+          border: 1px solid rgba(255,255,255,0.08);
+          background:
+            repeating-linear-gradient(
+              to bottom,
+              transparent 0 23px,
+              rgba(255,255,255,0.08) 23px 24px
+            );
+        }
+        .rolling-surface {
+          position: absolute;
+          inset: 0;
+          cursor: ns-resize;
+          touch-action: none;
+        }
+        .rolling-indicator {
+          position: absolute;
+          left: 4px;
+          right: 4px;
+          height: 4px;
+          border-radius: 99px;
+          background: rgba(255,255,255,0.9);
+          transform: translateY(-50%);
+          box-shadow: 0 0 8px rgba(255,255,255,0.35);
+          pointer-events: none;
+        }
+        .curve-side-right {
           display: flex;
           flex-direction: column;
-          gap: 6px;
-        }
-        .curve-point-row {
-          display: grid;
-          grid-template-columns: 18px 1fr 1fr;
           align-items: center;
+          justify-content: space-evenly;
           gap: 8px;
-          font-size: 10px;
           color: rgba(226,226,233,.5);
-        }
-        .curve-point-row input {
-          min-width: 0;
-        }
-        .curve-actions {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-        .curve-actions label {
-          display: flex;
-          align-items: center;
-          gap: 6px;
           font-size: 10px;
-          color: rgba(226,226,233,.5);
         }
-        .curve-actions input {
-          width: 48px;
-          height: 24px;
-          border-radius: 4px;
-          border: 1px solid rgba(255,255,255,.1);
-          background: rgba(255,255,255,.04);
-          color: rgb(226,226,233);
+        .curve-metric {
+          text-align: center;
+          cursor: ns-resize;
+          user-select: none;
+          touch-action: none;
         }
-        .curve-actions button,
+        .curve-metric strong {
+          display: block;
+          font-size: 42px;
+          line-height: 0.9;
+          color: rgba(226,226,233,.65);
+          font-weight: 700;
+        }
+        .curve-metric span {
+          display: block;
+          margin-top: 2px;
+          letter-spacing: .02em;
+        }
+        .curve-side-right button,
         .small-action {
-          height: 24px;
+          height: 28px;
+          min-width: 54px;
           padding: 0 8px;
           border-radius: 4px;
           border: 1px solid rgba(255,255,255,.08);
@@ -750,6 +1292,42 @@ export function Sidebar() {
           color: rgba(226,226,233,.75);
           font-size: 10px;
           cursor: pointer;
+        }
+        .curve-side-right button { width: 100%; }
+        .curve-control-button {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 3px;
+          height: 48px;
+          padding: 4px 6px;
+        }
+        .curve-control-button img {
+          width: 18px;
+          height: 18px;
+          opacity: .72;
+        }
+        .curve-control-button span {
+          line-height: 1;
+        }
+        .balance-readout {
+          display: flex;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 10px;
+          flex-wrap: wrap;
+        }
+        .balance-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          border-radius: 999px;
+          padding: 5px 10px;
+          border: 1px solid rgba(255,255,255,0.08);
+          background: rgba(255,255,255,0.03);
+          font-size: 11px;
+          color: rgba(226,226,233,.75);
         }
         .render-note {
           font-size: 10px;
@@ -880,34 +1458,42 @@ export function Sidebar() {
           onBypassToggle={handleBalanceBypass}
           onReset={() => resetPanel("balance")}
         >
-          <ValueSlider
-            label="Exposure"
-            value={editState().balance.exposure}
-            min={-3}
-            max={3}
-            onChange={(v) => handleBalanceChange("exposure", v)}
-          />
-          <ValueSlider
-            label="Saturation"
-            value={editState().balance.saturation}
-            min={-1}
-            max={1}
-            onChange={(v) => handleBalanceChange("saturation", v)}
-          />
-          <ValueSlider
-            label="Temperature"
-            value={editState().balance.temperature}
-            min={-1}
-            max={1}
-            onChange={(v) => handleBalanceChange("temperature", v)}
-          />
-          <ValueSlider
-            label="Tint"
-            value={editState().balance.tint}
-            min={-1}
-            max={1}
-            onChange={(v) => handleBalanceChange("tint", v)}
-          />
+          <div class="balance-readout">
+            <span class="balance-pill">
+              Exp {Math.round((editState().balance.exposure + 1) * 100)}% &nbsp;
+              Sat {Math.round((editState().balance.saturation + 1) * 100)}%
+            </span>
+            <span class="balance-pill">
+              Tnt {editState().balance.tint.toFixed(2)} &nbsp; Tmp{" "}
+              {editState().balance.temperature.toFixed(2)}
+            </span>
+          </div>
+          <div class="point-grid">
+            <PointPad
+              label="Exp / Sat"
+              variant="balance-left"
+              x={editState().balance.saturation}
+              y={editState().balance.exposure}
+              onChange={(point) => {
+                setEdit((s) => {
+                  s.balance.saturation = Math.max(-1, Math.min(1, point.x));
+                  s.balance.exposure = Math.max(-1, Math.min(1, point.y));
+                }, "Balance");
+              }}
+            />
+            <PointPad
+              label="Tnt / Tmp"
+              variant="balance-right"
+              x={editState().balance.tint}
+              y={editState().balance.temperature}
+              onChange={(point) => {
+                setEdit((s) => {
+                  s.balance.tint = Math.max(-1, Math.min(1, point.x));
+                  s.balance.temperature = Math.max(-1, Math.min(1, point.y));
+                }, "Balance");
+              }}
+            />
+          </div>
         </PanelSection>
 
         {/* ── RGB ─────────────────────────────────────────────────────────── */}
@@ -925,8 +1511,14 @@ export function Sidebar() {
             label="Exposure"
             curve={editState().exposure.curve}
             onPointChange={(i, p) => handleCurvePointChange("exposure", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("exposure", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("exposure")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("exposure", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("exposure", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("exposure", delta)}
+            onReset={() => resetPanel("exposure")}
           />
         </PanelSection>
 
@@ -943,9 +1535,16 @@ export function Sidebar() {
           <CurveEditor
             label="Contrast"
             curve={editState().contrast.curve}
+            identityReset
             onPointChange={(i, p) => handleCurvePointChange("contrast", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("contrast", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("contrast")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("contrast", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("contrast", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("contrast", delta)}
+            onReset={() => resetPanel("contrast")}
           />
           <ValueSlider
             label="Smart"
@@ -1068,8 +1667,14 @@ export function Sidebar() {
             hueMode
             lineColor="rgba(255,255,255,.9)"
             onPointChange={(i, p) => handleCurvePointChange("density", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("density", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("density")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("density", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("density", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("density", delta)}
+            onReset={() => resetPanel("density")}
           />
         </PanelSection>
 
@@ -1088,8 +1693,14 @@ export function Sidebar() {
             curve={editState().chroma.curve}
             lineColor="rgba(255,200,100,.9)"
             onPointChange={(i, p) => handleCurvePointChange("chroma", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("chroma", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("chroma")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("chroma", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("chroma", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("chroma", delta)}
+            onReset={() => resetPanel("chroma")}
           />
         </PanelSection>
 
@@ -1109,8 +1720,14 @@ export function Sidebar() {
             hueMode
             lineColor="rgba(255,255,180,.9)"
             onPointChange={(i, p) => handleCurvePointChange("radiance", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("radiance", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("radiance")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("radiance", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("radiance", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("radiance", delta)}
+            onReset={() => resetPanel("radiance")}
           />
         </PanelSection>
 
@@ -1129,8 +1746,14 @@ export function Sidebar() {
             curve={editState().saturation.curve}
             lineColor="rgba(100,200,255,.9)"
             onPointChange={(i, p) => handleCurvePointChange("saturation", i, p)}
-            onPointCountChange={(count) => handleCurvePointCount("saturation", count)}
-            onInterpolationToggle={() => handleCurveInterpolation("saturation")}
+            onPointCountChange={(count) =>
+              handleCurvePointCount("saturation", count)
+            }
+            onInterpolationChange={(next) =>
+              handleCurveInterpolation("saturation", next)
+            }
+            onOffsetAll={(delta) => handleCurveOffset("saturation", delta)}
+            onReset={() => resetPanel("saturation")}
           />
         </PanelSection>
 
@@ -1358,7 +1981,12 @@ export function Sidebar() {
           <button
             type="button"
             class="small-action"
-            onClick={() => showToast("Set zoom to 100% for accurate diffusion preview", "info")}
+            onClick={() =>
+              showToast(
+                "Set zoom to 100% for accurate diffusion preview",
+                "info",
+              )
+            }
           >
             Zoom to 100% for accurate preview
           </button>

@@ -406,7 +406,7 @@ export function PresetsPanel() {
         .presets-panel {
           display: flex;
           flex-direction: column;
-          gap: 8px;
+          gap: 10px;
           height: 100%;
         }
 
@@ -451,8 +451,8 @@ export function PresetsPanel() {
         .packs-scroll::-webkit-scrollbar { display: none; }
         .pack-btn {
           white-space: nowrap;
-          padding: 4px 10px;
-          border-radius: 12px;
+          padding: 6px 14px;
+          border-radius: 999px;
           font-size: 11px;
           font-weight: 600;
           background: rgba(255,255,255,0.05);
@@ -513,11 +513,11 @@ export function PresetsPanel() {
         /* ── Preset grid ──────────────────────────────────────────────────── */
         .presets-grid {
           flex: 1;
-          display: flex;
-          flex-direction: column;
-          gap: 1px;
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 6px;
           overflow-y: auto;
-          max-height: 180px;
+          max-height: 260px;
           padding-right: 2px;
           scrollbar-width: thin;
           scrollbar-color: rgba(255,255,255,0.06) transparent;
@@ -525,20 +525,19 @@ export function PresetsPanel() {
         .presets-grid::-webkit-scrollbar { width: 3px; }
         .presets-grid::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
         .preset-item {
-          padding: 6px 10px;
-          border-radius: 4px;
+          min-height: 58px;
+          padding: 8px 10px;
+          border-radius: 10px;
           font-size: 11px;
           font-weight: 500;
           cursor: pointer;
           color: rgba(226, 226, 233, 0.65);
           transition: all 120ms;
           text-align: left;
-          background: none;
-          border: none;
+          background: rgba(255,255,255,0.03);
+          border: 1px solid rgba(255,255,255,0.05);
           width: 100%;
           overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
         }
         .preset-item:hover {
           background: rgba(255,255,255,0.06);

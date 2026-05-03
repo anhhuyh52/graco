@@ -56,17 +56,17 @@ export function MatchPanel() {
     <div class="match-panel" data-state={matchState()}>
       <style>{`
         .match-panel { display: flex; flex-direction: column; gap: 12px; height: 100%; }
-        .refs-container { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; max-height: 200px; overflow-y: auto; padding-right: 4px; }
-        .ref-item { aspect-ratio: 1; border-radius: 4px; background: var(--theme-higher-050); cursor: pointer; border: 2px solid transparent; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        .refs-container { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; max-height: 300px; overflow-y: auto; padding-right: 4px; }
+        .ref-item { aspect-ratio: 1; border-radius: 12px; background: var(--theme-higher-050); cursor: pointer; border: 2px solid transparent; overflow: hidden; display: flex; align-items: center; justify-content: center; }
         .ref-item.selected { border-color: var(--theme-primary); }
         .ref-item img { width: 100%; height: 100%; object-fit: cover; }
         .ref-item.icon { padding: 8px; opacity: 0.5; }
-        .match-controls { position: relative; min-height: 80px; background: var(--theme-higher-050); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        .match-controls { position: relative; min-height: 96px; background: var(--theme-higher-050); border-radius: 12px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
         .info-box { display: flex; align-items: center; gap: 12px; padding: 0 16px; font-size: 11px; opacity: 0.6; }
         .progress-bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--theme-primary); width: 100%; transform-origin: left; }
         .match-panel[data-state="progress"] .progress-bar { animation: mp 1.75s linear; }
         @keyframes mp { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-        .sliders-overlay { width: 100%; display: flex; align-items: center; gap: 8px; padding: 0 12px; }
+        .sliders-overlay { width: 100%; display: flex; align-items: center; gap: 10px; padding: 0 12px; }
         .match-slider { flex: 1; display: flex; flex-direction: column; gap: 4px; }
         .slider-label { font-size: 10px; font-weight: 600; opacity: 0.5; text-transform: uppercase; }
         .slider-input { flex: 1; }
