@@ -3,11 +3,18 @@ import {
   useContext,
   createSignal,
   createMemo,
+  createEffect,
   type JSX,
   onCleanup,
   onMount,
 } from "solid-js";
-
+import {
+  validateImageFile,
+  validateImageDimensions,
+} from "../core/media/imageValidation";
+import { destroyWorkerClient, getWorkerClient } from "../workers/image-worker-client";
+import { destroyExportWorkerClient, getExportWorkerClient } from "../workers/export-worker-client";
+import { bakeCurveLut, createIdentityCurveLut } from "../core/curves/curveLut";
 // ─── Types ────────────────────────────────────────────────────────────────────
 export interface CurvePoint {
   x: number;
@@ -115,6 +122,9 @@ export interface ImageItem {
   bitmap: ImageBitmap | null;
   thumbnailURL: string;
   format: string;
+  sourceFile?: File;
+  sourceSize: number;
+  lastModified: number;
 }
 
 export interface MediaItem {
@@ -252,10 +262,22 @@ export const createDefaultEditState = (): EditState => ({
     threshold: 0.5,
     bypass: false,
   },
-  density: { curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"), bypass: false },
-  chroma: { curve: curveFromPoints(DEFAULT_CHROMA_POINTS, "Cubic"), bypass: false },
-  radiance: { curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"), bypass: false },
-  saturation: { curve: curveFromPoints(DEFAULT_SATURATION_POINTS, "Bezier"), bypass: false },
+  density: {
+    curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"),
+    bypass: false,
+  },
+  chroma: {
+    curve: curveFromPoints(DEFAULT_CHROMA_POINTS, "Cubic"),
+    bypass: false,
+  },
+  radiance: {
+    curve: curveFromPoints(DEFAULT_HUE_CURVE_POINTS, "Bezier"),
+    bypass: false,
+  },
+  saturation: {
+    curve: curveFromPoints(DEFAULT_SATURATION_POINTS, "Bezier"),
+    bypass: false,
+  },
   rgb: {
     shadowR: 0,
     shadowG: 0,
@@ -324,7 +346,12 @@ interface ColorIOContextType {
   importImages: (files: File[]) => Promise<void>;
   setActiveImage: (id: string) => void;
   removeImage: (id: string) => void;
-  setEdit: (updater: (state: EditState) => void, label?: string) => void;
+  setEdit: (
+    updater: (state: EditState) => void,
+    label?: string,
+    commit?: boolean,
+  ) => void;
+  previewEdit: (updater: ((state: EditState) => void) | null) => void;
   resetPanel: (panel: keyof EditState) => void;
   resetAll: () => void;
   undo: () => void;
@@ -337,6 +364,9 @@ interface ColorIOContextType {
   setOverlay: (name: string | null) => void;
   showToast: (msg: string, type?: "success" | "error" | "info") => void;
   removeToast: (id: string) => void;
+  exportCurrentImage: (format: "png" | "jpg") => Promise<void>;
+  exportCurrentLut: () => Promise<void>;
+  exportProject: () => Promise<void>;
 
   // Renderer
   initRenderer: (container: HTMLDivElement) => void;
@@ -344,6 +374,7 @@ interface ColorIOContextType {
   setRendererUniform: (key: string, value: any) => void;
   loadBitmap: (bitmap: ImageBitmap | null) => void;
   applyEditToRenderer: () => void;
+  onHistogram: (callback: (data: Uint32Array) => void) => () => void;
 }
 
 const ColorIOContext = createContext<ColorIOContextType>();
@@ -356,8 +387,42 @@ export function useColorIO() {
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
 import { Renderer } from "../lib/renderer";
+import type { Renderer as RendererType } from "../lib/renderer";
+
+// ── Curve LUT uniform mapping ─────────────────────────────────────────────────
+const CURVE_LUT_MAP = [
+  { key: 'exposure', uniform: 'uLutExposure' },
+  { key: 'contrast', uniform: 'uLutContrast' },
+  { key: 'density', uniform: 'uLutDensity' },
+  { key: 'chroma', uniform: 'uLutChroma' },
+  { key: 'radiance', uniform: 'uLutRadiance' },
+  { key: 'saturation', uniform: 'uLutSaturation' },
+] as const;
+
+const IDENTITY_CURVE_LUT = createIdentityCurveLut();
+
+/**
+ * Synchronously bake all active curve LUTs and upload to the renderer.
+ * Fast enough for main thread (~0.1ms for 6 curves × 256 samples).
+ * Called on every edit for instant curve response.
+ */
+function syncCurveLuts(es: EditState, r: RendererType): void {
+  for (const { key, uniform } of CURVE_LUT_MAP) {
+    const section = es[key as keyof EditState] as any;
+    if (section && 'curve' in section && !section.bypass) {
+      r.setLUT(uniform, bakeCurveLut(section.curve));
+    } else {
+      r.setLUT(uniform, IDENTITY_CURVE_LUT);
+    }
+  }
+}
 
 export function ColorIOProvider(props: { children: JSX.Element }) {
+  let lutRequestVersion = 0;
+  let histogramRequestVersion = 0;
+  let histogramInFlight = false;
+  const pendingToastTimers = new Set<number>();
+
   // Core state
   const [projects, setProjects] = createSignal<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = createSignal<string | null>(
@@ -403,19 +468,51 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     return m.images.find((i) => i.id === m.activeImageId) ?? null;
   });
 
-  const editState = createMemo(
-    () => activeMedia()?.editState ?? createDefaultEditState(),
+  const [liveEditState, setLiveEditState] = createSignal<EditState>(
+    createDefaultEditState(),
   );
+
+  const editState = createMemo(() => {
+    const media = activeMedia();
+    return media ? liveEditState() : createDefaultEditState();
+  });
+
+  // Sync liveEditState when activeMedia changes
+  createEffect(() => {
+    const media = activeMedia();
+    if (media) {
+      setLiveEditState(structuredClone(media.editState));
+    }
+  });
+
   const canUndo = createMemo(() => historyIndex() > 0);
   const canRedo = createMemo(() => historyIndex() < history().length - 1);
 
-  // ─── CORE HELPER: immutable media update ─────────────────────────────────────
-  // FIX: All mutation functions previously mutated objects in-place then called
-  // setProjects(prev => [...prev]). Because the project/media object references
-  // stayed the same, activeProject / activeMedia / editState memos never fired —
-  // the UI would not update on undo, redo, snapshot apply, etc.
-  // This helper always produces new object references all the way down the chain
-  // so SolidJS memos can detect the change.
+  const disposeImage = (image: ImageItem | null | undefined) => {
+    if (!image) return;
+    image.bitmap?.close();
+    if (image.thumbnailURL) URL.revokeObjectURL(image.thumbnailURL);
+  };
+
+  const disposeProject = (project: Project | null | undefined) => {
+    project?.userMedia.forEach((media) => media.images.forEach(disposeImage));
+  };
+
+  const makeDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    queueMicrotask(() => URL.revokeObjectURL(url));
+  };
+
+  const safeFileBaseName = (name: string) =>
+    name.replace(/\.[^.]+$/, "").replace(/[^a-z0-9._-]+/gi, "_") || "grade";
+
   const updateActiveMedia = (updater: (m: MediaItem) => MediaItem) => {
     const pId = activeProjectId();
     const mId = activeMedia()?.id;
@@ -456,14 +553,31 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
   };
 
   const setActiveProject = (id: string) => {
+    const nextProject = projects().find((p) => p.id === id) ?? null;
+    const nextMedia = nextProject?.userMedia.find((m) => m.id === nextProject.activeUserMediaId);
+    const nextImage = nextMedia?.images.find((i) => i.id === nextMedia.activeImageId);
     setActiveProjectId(id);
+    queueMicrotask(() => {
+      loadBitmap(nextImage?.bitmap ?? null);
+      applyEditToRenderer();
+    });
   };
 
   const deleteProject = (id: string) => {
+    const projectToDelete = projects().find((p) => p.id === id);
+    const deletingActiveProject = activeProjectId() === id;
+    if (deletingActiveProject) {
+      loadBitmap(null);
+    }
     setProjects((prev) => prev.filter((p) => p.id !== id));
-    if (activeProjectId() === id) {
+    disposeProject(projectToDelete);
+    if (deletingActiveProject) {
       const remaining = projects().filter((p) => p.id !== id);
       setActiveProjectId(remaining[0]?.id ?? null);
+      const nextProject = remaining[0];
+      const nextMedia = nextProject?.userMedia.find((m) => m.id === nextProject.activeUserMediaId);
+      const nextImage = nextMedia?.images.find((i) => i.id === nextMedia.activeImageId);
+      queueMicrotask(() => loadBitmap(nextImage?.bitmap ?? null));
     }
   };
 
@@ -498,11 +612,28 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     const newImages: ImageItem[] = [];
     for (const file of files) {
       try {
+        const fileValidation = validateImageFile(file);
+        if (!fileValidation.valid) {
+          showToast(`Skipped ${file.name}: ${fileValidation.error}`, "error");
+          continue;
+        }
+
         const bitmap = await createImageBitmap(file, {
           imageOrientation: "from-image",
           premultiplyAlpha: "none",
           colorSpaceConversion: "default",
         });
+
+        const dimValidation = validateImageDimensions(
+          bitmap.width,
+          bitmap.height,
+        );
+        if (!dimValidation.valid) {
+          bitmap.close();
+          showToast(`Skipped ${file.name}: ${dimValidation.error}`, "error");
+          continue;
+        }
+
         newImages.push({
           id: nanoid(),
           name: file.name,
@@ -511,9 +642,16 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
           bitmap,
           thumbnailURL: URL.createObjectURL(file),
           format: file.type,
+          sourceFile: file,
+          sourceSize: file.size,
+          lastModified: file.lastModified,
         });
-      } catch {
-        showToast(`Failed: ${file.name}`, "error");
+      } catch (e) {
+        console.error("Bitmap decode error:", e);
+        showToast(
+          `Failed to process: ${file.name} (Corrupted or unsupported)`,
+          "error",
+        );
       }
     }
 
@@ -573,6 +711,7 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     if (!media) return;
 
     const images = media.images.filter((i) => i.id !== id);
+    const removedImage = media.images.find((i) => i.id === id);
     const activeImageId =
       media.activeImageId === id
         ? (images[0]?.id ?? null)
@@ -585,50 +724,83 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
       queueMicrotask(() => {
         const img = images.find((i) => i.id === activeImageId);
         loadBitmap(img?.bitmap ?? null);
+        disposeImage(removedImage);
       });
+    } else {
+      disposeImage(removedImage);
     }
   };
 
   // FIX: was mutating media.editState in place — SolidJS memos never fired.
   // Now: clone → apply updater → immutable project update → GPU push.
-  const setEdit = (updater: (state: EditState) => void, label = "Edit") => {
+  const setEdit = (
+    updater: (state: EditState) => void,
+    label = "Edit",
+    commit = true,
+  ) => {
     const media = activeMedia();
     if (!media) {
       createProject("Untitled Project");
-      queueMicrotask(() => setEdit(updater, label));
+      queueMicrotask(() => setEdit(updater, label, commit));
       return;
     }
 
-    // Clone first so the updater mutates a fresh object, not the live state
-    const next = structuredClone(media.editState);
+    // Update live state immediately for UI responsiveness
+    const next = structuredClone(liveEditState());
     updater(next);
+    setLiveEditState(next);
 
-    // Truncate redo future, append, cap at 100
-    const newHistory = history().slice(0, historyIndex() + 1);
-    newHistory.push({ editState: structuredClone(next), label });
-    if (newHistory.length > 100) newHistory.shift();
-    setHistory(newHistory);
-    setHistoryIndex(newHistory.length - 1);
+    // Push to renderer immediately — uniforms + curve LUTs
+    const r = renderer();
+    if (r) {
+      lutRequestVersion += 1;
+      r.applyEditState(next, ui().globalBypass);
+      syncCurveLuts(next, r);
+    }
 
-    // Immutable update so activeMedia / editState memos fire
-    updateActiveMedia((m) => ({ ...m, editState: next }));
+    if (commit) {
+      // Truncate redo future, append, cap at 100
+      const newHistory = history().slice(0, historyIndex() + 1);
+      newHistory.push({ editState: structuredClone(next), label });
+      if (newHistory.length > 100) newHistory.shift();
+      setHistory(newHistory);
+      setHistoryIndex(newHistory.length - 1);
 
-    // Push directly — don't rely on memo timing for the GPU path
-    renderer()?.applyEditState(next, ui().globalBypass);
+      // Persist to project state
+      updateActiveMedia((m) => ({ ...m, editState: next }));
+    }
+  };
+
+  // Zero-lag, history-free preview for hover states
+  const previewEdit = (updater: ((state: EditState) => void) | null) => {
+    const r = renderer();
+    if (!r) return;
+    if (updater === null) {
+      lutRequestVersion += 1;
+      const es = editState();
+      r.applyEditState(es, ui().globalBypass);
+      syncCurveLuts(es, r);
+      return;
+    }
+    const next = structuredClone(editState());
+    updater(next);
+    lutRequestVersion += 1;
+    r.applyEditState(next, ui().globalBypass);
+    syncCurveLuts(next, r);
   };
 
   const resetPanel = (panel: keyof EditState) => {
     const defaults = createDefaultEditState();
     setEdit((s) => {
-      (s as any)[panel] = (defaults as any)[panel];
+      (s as any)[panel] = structuredClone((defaults as any)[panel]);
     }, `Reset ${panel}`);
   };
 
-  // FIX: was mutating media.editState and then spreading the array
   const resetAll = () => {
     const defaults = createDefaultEditState();
-    updateActiveMedia((m) => ({ ...m, editState: defaults }));
-    renderer()?.applyEditState(defaults, ui().globalBypass);
+    setEdit((s) => {
+      Object.assign(s, structuredClone(defaults));
+    }, "Reset All");
   };
 
   // FIX: was mutating media.editState directly
@@ -637,8 +809,10 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     const newIndex = historyIndex() - 1;
     setHistoryIndex(newIndex);
     const restored = structuredClone(history()[newIndex].editState);
+    setLiveEditState(restored);
     updateActiveMedia((m) => ({ ...m, editState: restored }));
-    renderer()?.applyEditState(restored, ui().globalBypass);
+    const r1 = renderer();
+    if (r1) { r1.applyEditState(restored, ui().globalBypass); syncCurveLuts(restored, r1); }
   };
 
   // FIX: same as undo
@@ -647,8 +821,10 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     const newIndex = historyIndex() + 1;
     setHistoryIndex(newIndex);
     const restored = structuredClone(history()[newIndex].editState);
+    setLiveEditState(restored);
     updateActiveMedia((m) => ({ ...m, editState: restored }));
-    renderer()?.applyEditState(restored, ui().globalBypass);
+    const r2 = renderer();
+    if (r2) { r2.applyEditState(restored, ui().globalBypass); syncCurveLuts(restored, r2); }
   };
 
   // FIX: was calling media.snapshots.push() — direct array mutation
@@ -671,8 +847,10 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     const snap = media.snapshots.find((s) => s.id === id);
     if (!snap) return;
     const restored = structuredClone(snap.editState);
+    setLiveEditState(restored);
     updateActiveMedia((m) => ({ ...m, editState: restored }));
-    renderer()?.applyEditState(restored, ui().globalBypass);
+    const r3 = renderer();
+    if (r3) { r3.applyEditState(restored, ui().globalBypass); syncCurveLuts(restored, r3); }
   };
 
   // FIX: was mutating media.snapshots directly
@@ -714,7 +892,11 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
   ) => {
     const id = nanoid();
     setToasts((prev) => [...prev, { id, msg, type }]);
-    setTimeout(() => removeToast(id), 4000);
+    const timer = window.setTimeout(() => {
+      pendingToastTimers.delete(timer);
+      removeToast(id);
+    }, 4000);
+    pendingToastTimers.add(timer);
   };
 
   const removeToast = (id: string) => {
@@ -725,9 +907,37 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
   const initRenderer = (container: HTMLDivElement) => {
     if (renderer()) return;
     const r = new Renderer(container);
+
+    r.onHistogramPixels(async (buffer) => {
+      if (!ui().showScopes || histogramInFlight) return;
+      const requestVersion = ++histogramRequestVersion;
+      histogramInFlight = true;
+      try {
+        const bins = await getWorkerClient().gradeHistogram(buffer, 128, 128);
+        if (requestVersion !== histogramRequestVersion || !ui().showScopes) return;
+        histogramCallbacks().forEach((cb) => cb(bins));
+      } catch (e) {
+        console.error("Histogram error:", e);
+      } finally {
+        if (requestVersion === histogramRequestVersion) {
+          histogramInFlight = false;
+        }
+      }
+    });
+
     setRenderer(r);
-    // Apply current state immediately after creation
     applyEditToRenderer();
+  };
+
+  const [histogramCallbacks, setHistogramCallbacks] = createSignal<
+    ((data: Uint32Array) => void)[]
+  >([]);
+
+  const onHistogram = (callback: (data: Uint32Array) => void) => {
+    setHistogramCallbacks((prev) => [...prev, callback]);
+    return () => {
+      setHistogramCallbacks((prev) => prev.filter((cb) => cb !== callback));
+    };
   };
 
   const setRendererUniform = (key: string, value: any) => {
@@ -738,21 +948,118 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     renderer()?.loadBitmap(bitmap);
   };
 
-  const applyEditToRenderer = () => {
+  const applyEditToRenderer = async () => {
     const r = renderer();
     if (!r) return;
-    r.applyEditState(editState(), ui().globalBypass);
+    const es = editState();
+
+    // Fast path: update uniforms + sync LUTs instantly
+    const requestVersion = ++lutRequestVersion;
+    r.applyEditState(es, ui().globalBypass);
+    syncCurveLuts(es, r);
+
+    // Offload heavy curve evaluation to worker
+    const curves = {
+      exposure: es.exposure.bypass ? undefined : es.exposure.curve,
+      contrast: es.contrast.bypass ? undefined : es.contrast.curve,
+      density: es.density.bypass ? undefined : es.density.curve,
+      chroma: es.chroma.bypass ? undefined : es.chroma.curve,
+      radiance: es.radiance.bypass ? undefined : es.radiance.curve,
+      saturation: es.saturation.bypass ? undefined : es.saturation.curve,
+    };
+
+    try {
+      const luts = await getWorkerClient().generateCurveLuts(curves);
+      if (requestVersion !== lutRequestVersion || renderer() !== r) return;
+      if (luts.exposure) r.setLUT("uLutExposure", luts.exposure);
+      if (luts.contrast) r.setLUT("uLutContrast", luts.contrast);
+      if (luts.density) r.setLUT("uLutDensity", luts.density);
+      if (luts.chroma) r.setLUT("uLutChroma", luts.chroma);
+      if (luts.radiance) r.setLUT("uLutRadiance", luts.radiance);
+      if (luts.saturation) r.setLUT("uLutSaturation", luts.saturation);
+    } catch (e) {
+      console.error("LUT generation error:", e);
+    }
   };
 
-  // FIX: renderer was never destroyed on unmount → rAF loop and GPU resources leaked
+  const exportCurrentImage = async (format: "png" | "jpg") => {
+    const r = renderer();
+    const image = activeImage();
+    if (!r || !image) {
+      showToast("No rendered image to export", "error");
+      return;
+    }
+
+    try {
+      showToast("Exporting image...", "info");
+      const mimeType = format === "png" ? "image/png" : "image/jpeg";
+      const blob = await r.exportCanvasBlob(mimeType, format === "jpg" ? 0.92 : undefined);
+      makeDownload(blob, `${safeFileBaseName(image.name)}-graded.${format === "png" ? "png" : "jpg"}`);
+      showToast("Image export complete", "success");
+    } catch (error) {
+      console.error("Image export error:", error);
+      showToast("Image export failed", "error");
+    }
+  };
+
+  const exportCurrentLut = async () => {
+    const media = activeMedia();
+    if (!media) {
+      showToast("No grade to export", "error");
+      return;
+    }
+
+    try {
+      const es = editState();
+      const curve = es.contrast.bypass ? createDefaultEditState().contrast.curve : es.contrast.curve;
+      const cube = await getExportWorkerClient().encodeLut1D("ColorIO SDR Contrast Curve", curve);
+      makeDownload(new Blob([cube], { type: "application/octet-stream" }), `${safeFileBaseName(media.name)}-contrast.cube`);
+      showToast("LUT export complete", "success");
+    } catch (error) {
+      console.error("LUT export error:", error);
+      showToast("LUT export failed", "error");
+    }
+  };
+
+  const exportProject = async () => {
+    const project = activeProject();
+    if (!project) {
+      showToast("No project to export", "error");
+      return;
+    }
+
+    try {
+      const serializableProject = {
+        ...project,
+        userMedia: project.userMedia.map((media) => ({
+          ...media,
+          images: media.images.map(({ bitmap, sourceFile, thumbnailURL, ...image }) => ({
+            ...image,
+            sourceName: sourceFile?.name,
+            sourceType: sourceFile?.type,
+          })),
+        })),
+      };
+
+      const json = await getExportWorkerClient().encodeProjectJson(serializableProject);
+      makeDownload(new Blob([json], { type: "application/json" }), `${safeFileBaseName(project.name)}.colorio.json`);
+      showToast("Project export complete", "success");
+    } catch (error) {
+      console.error("Project export error:", error);
+      showToast("Project export failed", "error");
+    }
+  };
+
   onCleanup(() => {
     renderer()?.destroy();
+    destroyWorkerClient();
+    destroyExportWorkerClient();
+    projects().forEach(disposeProject);
+    for (const timer of pendingToastTimers) window.clearTimeout(timer);
+    pendingToastTimers.clear();
   });
 
-  // ─── Keyboard shortcuts ─────────────────────────────────────────────────────
   onMount(() => {
-    // Keep controls interactive even before importing any image by ensuring
-    // there is always an active project/media target for setEdit().
     if (!activeProjectId() || !activeMedia()) {
       createProject("Untitled Project");
     }
@@ -831,6 +1138,7 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     setActiveImage,
     removeImage,
     setEdit,
+    previewEdit,
     resetPanel,
     resetAll,
     undo,
@@ -843,11 +1151,15 @@ export function ColorIOProvider(props: { children: JSX.Element }) {
     setOverlay,
     showToast,
     removeToast,
+    exportCurrentImage,
+    exportCurrentLut,
+    exportProject,
     initRenderer,
     renderer,
     setRendererUniform,
     loadBitmap,
     applyEditToRenderer,
+    onHistogram,
   };
 
   return (

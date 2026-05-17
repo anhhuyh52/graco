@@ -1,0 +1,277 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   curve.css
+   All curve editor styles: canvas, points, rolling slider, toolbar.
+   Professional Resolve-like appearance: precision-first, technical grid,
+   hardware-inspired hit areas and readouts.
+───────────────────────────────────────────────────────────────────────────── */
+
+/* ── Curve editor layout ─────────────────────────────────────────────────────── */
+.curve-editor {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 48px;
+  gap: var(--space-sm);
+  align-items: stretch;
+  min-height: 200px;
+}
+
+/* ── Curve canvas area ───────────────────────────────────────────────────────── */
+.curve-box {
+  position: relative;
+  min-height: 200px;
+  border-radius: 4px;
+  background: var(--bg-control);
+  border: 1px solid #111;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);
+  overflow: hidden;
+}
+
+/* Technical grid background */
+.curve-box::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: 
+    linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px);
+  background-size: 10% 10%;
+  pointer-events: none;
+}
+
+.curve-box.hue {
+  background: linear-gradient(
+    90deg,
+    rgba(229, 72, 77, 0.15),
+    rgba(245, 217, 10, 0.15),
+    rgba(70, 194, 99, 0.15),
+    rgba(41, 168, 255, 0.15),
+    rgba(143, 92, 255, 0.15),
+    rgba(229, 72, 77, 0.15)
+  ), var(--bg-control);
+}
+
+/* ── SVG path ────────────────────────────────────────────────────────────────── */
+.curve-box svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.curve-box path {
+  fill: none;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
+}
+
+/* ── Grid lines ──────────────────────────────────────────────────────────────── */
+.curve-grid-line {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Primary divisions at 25%, 50%, 75% */
+.curve-grid-line.vertical {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.curve-grid-line.horizontal {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+/* Middle gray (50%) gets a slightly stronger line */
+.curve-grid-line.vertical[style*="50%"],
+.curve-grid-line.horizontal[style*="50%"] {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.curve-diagonal {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 0;
+}
+
+.curve-diagonal line {
+  stroke: rgba(255, 255, 255, 0.1);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+/* ── Professional curve points ───────────────────────────────────────────────── */
+/* Hit area: large (28px) but invisible */
+.curve-point-hit {
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+
+.curve-point-hit:active {
+  cursor: grabbing;
+}
+
+/* Visual dot: precise, hardware-style */
+.curve-point-visual {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid #000;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+  transition: transform 50ms ease;
+  flex-shrink: 0;
+}
+
+.curve-point-hit:hover .curve-point-visual {
+  transform: scale(1.3);
+  background: #fff;
+  border-color: var(--accent-active);
+}
+
+.curve-point-hit.active .curve-point-visual {
+  background: var(--accent-active);
+  border-color: #fff;
+  transform: scale(1.5);
+}
+
+/* Endpoint points — visually distinct */
+.curve-point-hit.endpoint .curve-point-visual {
+  border-radius: 2px; /* Square endpoints */
+  background: var(--text-muted);
+  border-color: #000;
+}
+
+.curve-point-hit.endpoint:hover .curve-point-visual {
+  background: var(--text-primary);
+}
+
+.curve-point-hit.endpoint.active .curve-point-visual {
+  background: var(--accent-active);
+  border-color: #fff;
+}
+
+/* ── Rolling slider (left side) ──────────────────────────────────────────────── */
+.curve-side-left {
+  position: relative;
+  border-radius: 2px;
+  background: var(--bg-control);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
+  /* Textured grip pattern */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0 4px,
+    rgba(255, 255, 255, 0.05) 4px 5px
+  );
+}
+
+.rolling-surface {
+  position: absolute;
+  inset: 0;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.rolling-indicator {
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--text-primary);
+  border: 1px solid #000;
+  transform: translateY(-50%);
+  pointer-events: none;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+}
+
+/* ── Curve toolbar (right side) ──────────────────────────────────────────────── */
+.curve-side-right {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: var(--space-sm);
+}
+
+.curve-toolbar-btn {
+  width: 100%;
+  height: 24px;
+  padding: 0;
+  border-radius: 2px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  color: var(--text-secondary);
+  font-size: var(--font-size-md);
+  cursor: pointer;
+  transition: all 100ms;
+  text-align: center;
+}
+
+.curve-toolbar-btn:hover {
+  background: var(--border-subtle);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.curve-toolbar-btn:active {
+  background: var(--border-strong);
+}
+
+/* ── Point count display ─────────────────────────────────────────────────────── */
+.curve-point-count {
+  text-align: center;
+  cursor: ns-resize;
+  user-select: none;
+  touch-action: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  border-radius: 2px;
+  color: var(--text-secondary);
+  padding: var(--space-sm) 0;
+  line-height: 1;
+  transition: all 100ms;
+}
+
+.curve-point-count:hover {
+  background: var(--border-subtle);
+  border-color: var(--border-strong);
+}
+
+.curve-point-count strong {
+  display: block;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 2px;
+}
+
+.curve-point-count span {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.8;
+}

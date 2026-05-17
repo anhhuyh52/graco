@@ -10,6 +10,7 @@ export function Viewport() {
     importImages,
     activeMedia,
     setActiveImage,
+    onHistogram,
   } = useColorIO();
 
   let containerRef: HTMLDivElement | undefined;
@@ -18,15 +19,6 @@ export function Viewport() {
   const [isDragging, setIsDragging] = createSignal(false);
 
   const ZOOM_STEPS = [25, 50, 75, 100, 150, 200, 300, 400];
-  onMount(() => {
-    if (containerRef) {
-      initRenderer(containerRef);
-    }
-
-    const resizeObserver = new ResizeObserver(() => applyZoom());
-    if (containerRef) resizeObserver.observe(containerRef);
-    onCleanup(() => resizeObserver.disconnect());
-  });
 
   const getOneToOneScale = () => {
     const img = activeImage();
@@ -137,7 +129,7 @@ export function Viewport() {
   const handleOpenImages = () => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "image/*";
+    input.accept = "image/jpeg,image/png,image/webp,image/avif";
     input.multiple = true;
     input.style.display = "none"; // hide it
     document.body.appendChild(input); // must be in DOM
@@ -158,54 +150,62 @@ export function Viewport() {
   };
   const images = () => activeMedia()?.images ?? [];
 
-  const drawScope = () => {
+  const [histogramData, setHistogramData] = createSignal<Uint32Array | null>(null);
+
+  onMount(() => {
+    if (containerRef) {
+      initRenderer(containerRef);
+    }
+
+    const unsubscribeHistogram = onHistogram((data) => {
+      if (ui().showScopes) {
+        setHistogramData(new Uint32Array(data));
+      }
+    });
+
+    const resizeObserver = new ResizeObserver(() => applyZoom());
+    if (containerRef) resizeObserver.observe(containerRef);
+    onCleanup(() => {
+      unsubscribeHistogram();
+      resizeObserver.disconnect();
+    });
+  });
+
+  const drawScope = (data: Uint32Array) => {
     const canvas = canvasRef;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const img = activeImage();
-    if (!img?.bitmap) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      return;
-    }
-
-    const off = new OffscreenCanvas(128, 128);
-    const oct = off.getContext("2d");
-    if (!oct) return;
-    oct.drawImage(img.bitmap, 0, 0, 128, 128);
-    const data = oct.getImageData(0, 0, 128, 128).data;
-
     ctx.fillStyle = "#0a0a0d";
     ctx.fillRect(0, 0, 280, 130);
 
-    const bins = Array.from({ length: 256 }, () => [0, 0, 0]);
-    for (let i = 0; i < data.length; i += 4) {
-      bins[data[i]][0]++;
-      bins[data[i + 1]][1]++;
-      bins[data[i + 2]][2]++;
-    }
+    const rBins = data.slice(0, 256);
+    const gBins = data.slice(256, 512);
+    const bBins = data.slice(512, 768);
 
-    const peak = Math.max(...bins.flatMap((b) => b)) || 1;
-    const channels: Array<[number, string]> = [
-      [0, "rgba(255,70,70,.6)"],
-      [1, "rgba(70,200,100,.6)"],
-      [2, "rgba(70,120,255,.6)"],
+    const peak = Math.max(...data) || 1;
+    const channels: Array<[Uint32Array, string]> = [
+      [rBins, "rgba(255, 70, 70, 0.6)"],
+      [gBins, "rgba(70, 200, 100, 0.6)"],
+      [bBins, "rgba(70, 120, 255, 0.6)"],
     ];
 
-    for (const [ci, color] of channels) {
+    ctx.globalCompositeOperation = "lighter";
+    for (const [bins, color] of channels) {
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.moveTo(0, 130);
       for (let i = 0; i < 256; i++) {
         const x = (i / 255) * 280;
-        const y = 130 - (bins[i][ci] / peak) * 124;
+        const y = 130 - (bins[i] / peak) * 124;
         i === 0 ? ctx.moveTo(x, 130) : ctx.lineTo(x, y);
       }
       ctx.lineTo(280, 130);
       ctx.closePath();
       ctx.fill();
     }
+    ctx.globalCompositeOperation = "source-over";
   };
 
   createEffect(() => {
@@ -215,8 +215,10 @@ export function Viewport() {
   });
 
   createEffect(() => {
-    if (!ui().showScopes) return;
-    drawScope();
+    const data = histogramData();
+    if (data && ui().showScopes) {
+      drawScope(data);
+    }
   });
 
   return (
@@ -358,13 +360,28 @@ export function Viewport() {
           justify-content: center;
           z-index: 1;
           background: rgb(29, 29, 35);
+          padding: clamp(10px, 2vw, 20px);
+        }
+        .start-card {
+          width: min(92vw, 900px);
+          height: min(78vh, 740px);
+          border: 1px solid rgba(226, 226, 233, 0.12);
+          border-radius: 28px;
+          background: linear-gradient(
+            180deg,
+            rgba(19, 20, 27, 0.96) 0%,
+            rgba(16, 17, 24, 0.96) 100%
+          );
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
         }
         .start-header {
           width: 100%;
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 24px 28px;
+          padding: clamp(14px, 1.9vw, 26px) clamp(14px, 2.2vw, 30px);
         }
         .start-header img { height: 20px; }
         .start-version { font-size: 11px; opacity: 0.5; }
@@ -376,12 +393,14 @@ export function Viewport() {
           justify-content: center;
           position: relative;
           width: 100%;
+          min-height: 0;
+          padding: 0 clamp(6px, 1.2vw, 16px);
         }
         .start-bg {
           width: 100%;
-          opacity: 0.5;
-          max-height: 50vh;
-          object-fit: contain;
+          opacity: 0.18;
+          height: 100%;
+          object-fit: cover;
         }
         .start-actions {
           position: absolute;
@@ -415,7 +434,7 @@ export function Viewport() {
         }
         .action-btn.primary:hover { background: #5a9aff; }
         .start-footer {
-          padding: 24px 12px;
+          padding: clamp(14px, 1.8vw, 24px) clamp(14px, 2.2vw, 28px);
           display: flex;
           align-items: center;
           justify-content: center;
@@ -515,15 +534,15 @@ export function Viewport() {
       <div class="viewport-overlay">
         <Show when={activeImage()}>
           <div class="zoom-group">
-          <button class="zoom-btn" onClick={zoomOut}>
-            −
-          </button>
-          <button class="zoom-label" onClick={zoomFit}>
-            {zoomLevel() === "fit" ? "Fit" : `${zoomLevel()}%`}
-          </button>
-          <button class="zoom-btn" onClick={zoomIn}>
-            +
-          </button>
+            <button class="zoom-btn" onClick={zoomOut}>
+              −
+            </button>
+            <button class="zoom-label" onClick={zoomFit}>
+              {zoomLevel() === "fit" ? "Fit" : `${zoomLevel()}%`}
+            </button>
+            <button class="zoom-btn" onClick={zoomIn}>
+              +
+            </button>
           </div>
         </Show>
         <div style={{ flex: 1 }} />
@@ -534,35 +553,37 @@ export function Viewport() {
 
       <Show when={!activeImage()}>
         <div class="start-screen">
-          <header class="start-header">
-            <img src="/assets/cio_logo.svg" alt="Color.io" />
-            <span class="start-version">Version 3.3.3</span>
-          </header>
-          <section class="start-content">
-            <img
-              class="start-bg"
-              src="/assets/img/cio_gallery.avif"
-              alt="Gallery"
-            />
-            <div class="start-actions">
-              <button
-                class="action-btn secondary"
-                onClick={() => setUI("overlay", "projects")}
-              >
-                Create Project
-              </button>
-              <button class="action-btn primary" onClick={handleOpenImages}>
-                Open Image(s)
-              </button>
-            </div>
-          </section>
-          <footer class="start-footer">
-            <img src="/assets/icons/hand_icon.svg" alt="" />
-            <div class="start-footer-text">
-              <strong>Your images are never uploaded.</strong> Color.io works
-              offline on your device.
-            </div>
-          </footer>
+          <div class="start-card">
+            <header class="start-header">
+              <img src="/assets/cio_logo.svg" alt="Color.io" />
+              <span class="start-version">Version 3.3.3</span>
+            </header>
+            <section class="start-content">
+              <img
+                class="start-bg"
+                src="/assets/img/cio_gallery.avif"
+                alt="Gallery"
+              />
+              <div class="start-actions">
+                <button
+                  class="action-btn secondary"
+                  onClick={() => setUI("overlay", "projects")}
+                >
+                  Create Project
+                </button>
+                <button class="action-btn primary" onClick={handleOpenImages}>
+                  Open Image(s)
+                </button>
+              </div>
+            </section>
+            <footer class="start-footer">
+              <img src="/assets/icons/hand_icon.svg" alt="" />
+              <div class="start-footer-text">
+                <strong>Your images are never uploaded.</strong> Color.io works
+                offline on your device.
+              </div>
+            </footer>
+          </div>
         </div>
       </Show>
 

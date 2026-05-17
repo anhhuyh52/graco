@@ -1,5 +1,6 @@
 import { createSignal, createResource, For, Show } from "solid-js";
 import { useColorIO, type EditState } from "../../context/ColorIOContext";
+import { resolveAsset } from "../../core/assets/resolveAsset";
 
 const ALL_PACKS_SENTINEL = "__ALL__";
 
@@ -306,9 +307,8 @@ async function fetchPresets() {
   for (const pack of PACKS) {
     if (pack.id === "custom") continue;
     try {
-      const res = await fetch(
-        `/assets/presets/official/${encodeURIComponent(pack.name)}.json`,
-      );
+      const url = resolveAsset(`assets/presets/official/${encodeURIComponent(pack.name)}.json`);
+      const res = await fetch(url);
       if (!res.ok) continue;
       const data = await res.json();
       const presets: any[] = Array.isArray(data) ? data : (data.presets ?? []);
@@ -332,10 +332,60 @@ function groupBy<T extends { group: string }>(items: T[]) {
 }
 
 export function PresetsPanel() {
-  const { setEdit, showToast, editState } = useColorIO();
+  const { setEdit, previewEdit, showToast, editState } = useColorIO();
   const [currentPack, setCurrentPack] = createSignal(ALL_PACKS_SENTINEL);
   const [searchQuery, setSearchQuery] = createSignal("");
   const [isSearching, setIsSearching] = createSignal(false);
+  const [showLibraryModal, setShowLibraryModal] = createSignal(false);
+  const [showGeneratorModal, setShowGeneratorModal] = createSignal(false);
+  const [selectedVariant, setSelectedVariant] = createSignal<number | null>(null);
+  type GeneratorVariant = {
+    id: string;
+    preview: number;
+    deltas: {
+      exposure: number;
+      saturation: number;
+      temperature: number;
+      tint: number;
+      smartContrast: number;
+      halation: number;
+      diffusion: number;
+      grain: number;
+    };
+  };
+  const clamp = (v: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, v));
+
+  // Cinematic look families for generator
+  const LOOK_FAMILIES = [
+    { name: "Warm Bleach", exp: 0.1, sat: -0.2, temp: 0.3, tint: 0.1, con: 0.2, hal: 0.3, diff: 0.1, gr: 0.4 },
+    { name: "Cold Shadow", exp: -0.05, sat: 0.1, temp: -0.25, tint: 0.05, con: 0.15, hal: 0.1, diff: 0.05, gr: 0.2 },
+    { name: "Soft Print", exp: 0, sat: -0.05, temp: 0.1, tint: 0, con: -0.1, hal: 0.2, diff: 0.3, gr: 0.3 },
+    { name: "High Contrast Film", exp: 0.05, sat: 0.15, temp: 0, tint: -0.05, con: 0.4, hal: 0.15, diff: 0.1, gr: 0.5 },
+  ];
+
+  const makeVariant = (base = 92, index = 0): GeneratorVariant => {
+    const family = LOOK_FAMILIES[index % LOOK_FAMILIES.length];
+    const variance = (Math.random() - 0.5) * 0.5; // Slight randomness within family
+    const preview = clamp(base + (Math.random() * 42 - 21), 28, 180);
+    return {
+      id: Math.random().toString(36).slice(2, 8).toUpperCase(),
+      preview: Math.round(preview),
+      deltas: {
+        exposure: family.exp + variance * 0.1,
+        saturation: family.sat + variance * 0.2,
+        temperature: family.temp + variance * 0.2,
+        tint: family.tint + variance * 0.1,
+        smartContrast: clamp(family.con + variance * 0.2, 0, 1),
+        halation: clamp(family.hal + variance * 0.2, 0, 1),
+        diffusion: clamp(family.diff + variance * 0.1, 0, 1),
+        grain: clamp(family.gr + variance * 0.3, 0, 1),
+      },
+    };
+  };
+  const [variants, setVariants] = createSignal<GeneratorVariant[]>(
+    Array.from({ length: 63 }, (_, i) => makeVariant(92, i)),
+  );
   const [presets] = createResource(fetchPresets);
 
   const groupedInputCS = () => groupBy(INPUT_COLORSPACES);
@@ -348,10 +398,22 @@ export function PresetsPanel() {
 
     return all.filter((p) => {
       const packMatch = pack === ALL_PACKS_SENTINEL || p._packName === pack;
-      const queryMatch =
-        !query ||
-        (p.name ?? "").toLowerCase().includes(query) ||
-        (p.meta?.description ?? "").toLowerCase().includes(query);
+      if (!query) return packMatch;
+
+      const searchStr = `${p.name} ${p.meta?.description ?? ""} ${p._packName}`.toLowerCase();
+      let queryMatch = searchStr.includes(query);
+
+      // Smart Semantic Matcher
+      if (!queryMatch) {
+        const isWarm = query.includes("warm") || query.includes("hot");
+        const isCold = query.includes("cold") || query.includes("cool");
+        const isCinematic = query.includes("cine") || query.includes("film");
+
+        if (isWarm && (searchStr.includes("gold") || searchStr.includes("warm") || searchStr.includes("sun"))) queryMatch = true;
+        if (isCold && (searchStr.includes("blue") || searchStr.includes("cool") || searchStr.includes("cyan"))) queryMatch = true;
+        if (isCinematic && (p._packName.includes("Kodak") || p._packName.includes("Fuji") || p._packName.includes("Vision"))) queryMatch = true;
+      }
+
       return packMatch && queryMatch;
     });
   };
@@ -368,7 +430,7 @@ export function PresetsPanel() {
             preset[key] !== undefined &&
             preset[key] !== null
           ) {
-            (s as any)[key] = preset[key];
+            (s as any)[key] = structuredClone(preset[key]);
           }
         }
       },
@@ -388,11 +450,29 @@ export function PresetsPanel() {
   };
 
   const handleLibrary = () => {
-    showToast("Preset library is not connected yet", "info");
+    setShowLibraryModal(true);
   };
 
   const handleGenerate = () => {
-    showToast("Preset generator is not connected yet", "info");
+    setShowGeneratorModal(true);
+    if (selectedVariant() == null) setSelectedVariant(0);
+  };
+
+  const regenerateVariants = () => {
+    setVariants(Array.from({ length: 63 }, () => makeVariant()));
+    setSelectedVariant(null);
+  };
+
+  const extendVariants = () => {
+    const seed = selectedVariant();
+    if (seed == null) {
+      regenerateVariants();
+      return;
+    }
+    const base = variants()[seed]?.preview ?? 92;
+    setVariants(
+      Array.from({ length: 63 }, (_, i) => makeVariant(base, i)),
+    );
   };
 
   const exitSearch = () => {
@@ -408,6 +488,7 @@ export function PresetsPanel() {
           flex-direction: column;
           gap: 10px;
           height: 100%;
+          position: relative;
         }
 
         /* ── Color space selectors ────────────────────────────────────────── */
@@ -510,14 +591,14 @@ export function PresetsPanel() {
         }
         .search-input::placeholder { color: rgba(226,226,233,0.3); }
 
-        /* ── Preset grid ──────────────────────────────────────────────────── */
+        /* ── Preset grid ── */
         .presets-grid {
           flex: 1;
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap: 6px;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 8px;
           overflow-y: auto;
-          max-height: 260px;
+          max-height: 280px;
           padding-right: 2px;
           scrollbar-width: thin;
           scrollbar-color: rgba(255,255,255,0.06) transparent;
@@ -525,27 +606,57 @@ export function PresetsPanel() {
         .presets-grid::-webkit-scrollbar { width: 3px; }
         .presets-grid::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
         .preset-item {
-          min-height: 58px;
-          padding: 8px 10px;
-          border-radius: 10px;
+          display: flex;
+          flex-direction: column;
+          justify-content: flex-end;
+          min-height: 86px;
+          padding: 12px;
+          border-radius: 12px;
           font-size: 11px;
-          font-weight: 500;
+          font-weight: 600;
           cursor: pointer;
           color: rgba(226, 226, 233, 0.65);
-          transition: all 120ms;
+          transition: all 180ms cubic-bezier(0.4, 0, 0.2, 1);
           text-align: left;
-          background: rgba(255,255,255,0.03);
-          border: 1px solid rgba(255,255,255,0.05);
-          width: 100%;
+          background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.04));
+          border: 1px solid rgba(255,255,255,0.04);
+          position: relative;
           overflow: hidden;
         }
-        .preset-item:hover {
-          background: rgba(255,255,255,0.06);
-          color: rgb(226, 226, 233);
+        .preset-item::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(0deg, rgba(77,138,240,0.1), transparent);
+          opacity: 0;
+          transition: opacity 180ms ease;
         }
+        .preset-item:hover {
+          background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.07));
+          color: rgb(226, 226, 233);
+          border-color: rgba(255,255,255,0.1);
+          transform: translateY(-1px);
+        }
+        .preset-item:hover::before { opacity: 1; }
         .preset-item:active {
-          background: rgba(77,138,240,0.12);
-          color: rgb(77,138,240);
+          transform: translateY(1px);
+          border-color: rgba(77,138,240,0.4);
+        }
+        .preset-name {
+          position: relative;
+          font-size: 13px;
+          font-weight: 700;
+          color: rgba(226,226,233, 0.95);
+          margin-bottom: 2px;
+          z-index: 1;
+        }
+        .preset-pack {
+          position: relative;
+          font-size: 9px;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: rgba(226,226,233, 0.4);
+          z-index: 1;
         }
 
         /* ── Empty / loading states ───────────────────────────────────────── */
@@ -566,6 +677,124 @@ export function PresetsPanel() {
           opacity: 0.35;
           text-align: center;
           padding: 20px 0;
+        }
+        .overlay-modal {
+          position: fixed;
+          inset: 0;
+          background: rgba(8, 9, 14, 0.64);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 120;
+          backdrop-filter: blur(3px);
+        }
+        .modal-card {
+          width: min(760px, 94vw);
+          max-height: 84vh;
+          overflow: auto;
+          border-radius: 14px;
+          border: 1px solid rgba(255,255,255,.1);
+          background: linear-gradient(180deg, rgba(24,25,34,.98), rgba(18,19,27,.98));
+          box-shadow: 0 18px 52px rgba(0,0,0,.45);
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+        }
+        .modal-header {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .modal-title {
+          font-size: 15px;
+          font-weight: 700;
+          color: rgba(226,226,233,.95);
+        }
+        .modal-subtitle {
+          color: rgba(226,226,233,.52);
+          font-size: 11px;
+          margin-top: 2px;
+        }
+        .modal-close {
+          margin-left: auto;
+          border: 1px solid rgba(255,255,255,.1);
+          background: rgba(255,255,255,.04);
+          color: rgba(226,226,233,.8);
+          border-radius: 8px;
+          padding: 6px 10px;
+          font-size: 11px;
+          cursor: pointer;
+        }
+        .library-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+          gap: 10px;
+        }
+        .library-pack {
+          border: 1px solid rgba(255,255,255,.09);
+          border-radius: 10px;
+          overflow: hidden;
+          background: rgba(255,255,255,.03);
+        }
+        .library-pack img {
+          width: 100%;
+          height: 90px;
+          object-fit: cover;
+          display: block;
+        }
+        .library-pack-info {
+          padding: 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .library-pack-name {
+          font-size: 11px;
+          font-weight: 700;
+          color: rgba(226,226,233,.9);
+        }
+        .library-pack button {
+          border: 1px solid rgba(255,255,255,.1);
+          background: rgba(255,255,255,.04);
+          color: rgba(226,226,233,.85);
+          border-radius: 8px;
+          padding: 6px 8px;
+          font-size: 11px;
+          cursor: pointer;
+        }
+        .generator-grid {
+          display: grid;
+          grid-template-columns: repeat(9, minmax(0, 1fr));
+          gap: 4px;
+        }
+        .generator-cell {
+          aspect-ratio: 1;
+          border: 1px solid rgba(255,255,255,.1);
+          border-radius: 6px;
+          cursor: pointer;
+          transition: transform .12s ease, outline-color .12s ease;
+          outline: 1px solid transparent;
+        }
+        .generator-cell:hover {
+          transform: translateY(-1px);
+        }
+        .generator-cell.active {
+          outline-color: rgb(77,138,240);
+        }
+        .generator-actions {
+          display: flex;
+          gap: 6px;
+          justify-content: flex-end;
+        }
+        .generator-actions button {
+          border: 1px solid rgba(255,255,255,.1);
+          background: rgba(255,255,255,.04);
+          color: rgba(226,226,233,.86);
+          border-radius: 8px;
+          padding: 7px 10px;
+          font-size: 11px;
+          cursor: pointer;
         }
       `}</style>
 
@@ -686,14 +915,165 @@ export function PresetsPanel() {
           {(preset) => (
             <button
               class="preset-item"
-              onClick={() => handleApplyPreset(preset)}
+              onClick={() => {
+                previewEdit(null); // Clear preview before applying
+                handleApplyPreset(preset);
+              }}
+              onMouseEnter={() => {
+                previewEdit((s) => {
+                  for (const key of EDIT_STATE_KEYS) {
+                    if (key in preset && preset[key] != null) {
+                      (s as any)[key] = structuredClone(preset[key]);
+                    }
+                  }
+                });
+              }}
+              onMouseLeave={() => previewEdit(null)}
               title={preset.name}
             >
-              {preset.name}
+              <div class="preset-name">{preset.name}</div>
+              <div class="preset-pack">{preset._packName}</div>
             </button>
           )}
         </For>
       </div>
+
+      <Show when={showLibraryModal()}>
+        <div class="overlay-modal" onClick={() => setShowLibraryModal(false)}>
+          <div class="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div class="modal-header">
+              <img src={resolveAsset("assets/icons/presets_icon.svg")} width="16" height="16" alt="" />
+              <div>
+                <div class="modal-title">Preset Library</div>
+                <button class="modal-close" onClick={() => setShowLibraryModal(false)}>
+                  Close
+                </button>
+              </div>
+                <div class="library-grid">
+                  <For each={PACKS.filter((p) => p.id !== "custom")}>
+                    {(pack) => (
+                      <div class="library-pack">
+                        <img src={pack.thumb} alt={pack.name} />
+                        <div class="library-pack-info">
+                          <span class="library-pack-name">{pack.name}</span>
+                          <button
+                            onClick={() => {
+                              setCurrentPack(pack.name);
+                              setShowLibraryModal(false);
+                              showToast(`Selected pack "${pack.name}"`, "success");
+                            }}
+                          >
+                            Open Pack
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </div>
+            </div>
+          </div>
+        </Show>
+
+      <Show when={showGeneratorModal()}>
+        <div class="overlay-modal" onClick={() => setShowGeneratorModal(false)}>
+          <div class="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div class="modal-header">
+              <img src="/assets/icons/sprinkle_icon.svg" width="16" height="16" alt="" />
+              <div>
+                <div class="modal-title">Spectra AI Generator</div>
+                <div class="modal-subtitle">
+                  Select a variant, extend, regenerate, or apply.
+                </div>
+              </div>
+              <button class="modal-close" onClick={() => setShowGeneratorModal(false)}>
+                Close
+              </button>
+            </div>
+            <div class="generator-grid">
+              <For each={variants()}>
+                {(variant, idx) => (
+                  <button
+                    class={`generator-cell ${selectedVariant() === idx() ? "active" : ""}`}
+                    style={{
+                      background: `rgb(${variant.preview}, ${variant.preview}, ${variant.preview})`,
+                    }}
+                    title={`Variant #${idx() + 1} · ${variant.id}`}
+                    onClick={() => setSelectedVariant(idx())}
+                  />
+                )}
+              </For>
+            </div>
+            <div class="generator-actions">
+              <button onClick={extendVariants}>Generate More Like This</button>
+              <button onClick={regenerateVariants}>Re-Generate All</button>
+              <button
+                onClick={() => {
+                  const idx = selectedVariant();
+                  if (idx == null) {
+                    showToast("Choose a variant first", "info");
+                    return;
+                  }
+                  const chosen = variants()[idx];
+                  if (!chosen) {
+                    showToast("Variant not available", "error");
+                    return;
+                  }
+                  setEdit(
+                    (s) => {
+                      s.balance.exposure = clamp(
+                        s.balance.exposure + chosen.deltas.exposure,
+                        -1,
+                        1,
+                      );
+                      s.balance.saturation = clamp(
+                        s.balance.saturation + chosen.deltas.saturation,
+                        -1,
+                        1,
+                      );
+                      s.balance.temperature = clamp(
+                        s.balance.temperature + chosen.deltas.temperature,
+                        -1,
+                        1,
+                      );
+                      s.balance.tint = clamp(
+                        s.balance.tint + chosen.deltas.tint,
+                        -1,
+                        1,
+                      );
+                      s.contrast.smartContrast = clamp(
+                        chosen.deltas.smartContrast,
+                        0,
+                        1,
+                      );
+                      s.halation.amount = clamp(
+                        Math.max(s.halation.amount, chosen.deltas.halation),
+                        0,
+                        1,
+                      );
+                      s.diffusion.amount = clamp(
+                        Math.max(s.diffusion.amount, chosen.deltas.diffusion),
+                        0,
+                        1,
+                      );
+                      s.texture.grainAmount = clamp(
+                        Math.max(s.texture.grainAmount, chosen.deltas.grain),
+                        0,
+                        1,
+                      );
+                    },
+                    `Spectra Variant ${chosen.id}`,
+                  );
+                  showToast(`Applied variant #${idx + 1} (${chosen.id})`, "success");
+                  setShowGeneratorModal(false);
+                }}
+              >
+                Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 }

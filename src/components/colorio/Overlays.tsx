@@ -27,7 +27,7 @@ export function ProjectsOverlay() {
   const handleOpenImages = () => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "image/*";
+    input.accept = "image/jpeg,image/png,image/webp,image/avif";
     input.multiple = true;
     input.onchange = () => {
       if (input.files?.length) {
@@ -297,14 +297,19 @@ export function ProjectsOverlay() {
 }
 
 export function ExportOverlay() {
-  const { setOverlay, showToast } = useColorIO();
-  const [activeTab, setActiveTab] = createSignal<"image" | "lut">("image");
-  const [format, setFormat] = createSignal("jpg");
+  const { setOverlay, exportCurrentImage, exportCurrentLut, exportProject } = useColorIO();
+  const [activeTab, setActiveTab] = createSignal<"image" | "lut" | "project">("image");
+  const [format, setFormat] = createSignal<"jpg" | "png">("jpg");
 
-  const handleExport = () => {
-    showToast("Exporting...", "info");
+  const handleExport = async () => {
+    if (activeTab() === "image") {
+      await exportCurrentImage(format());
+    } else if (activeTab() === "lut") {
+      await exportCurrentLut();
+    } else {
+      await exportProject();
+    }
     setOverlay(null);
-    setTimeout(() => showToast("Export complete", "success"), 800);
   };
 
   return (
@@ -444,6 +449,12 @@ export function ExportOverlay() {
             >
               Export LUT
             </button>
+            <button
+              class={`tab ${activeTab() === "project" ? "active" : ""}`}
+              onClick={() => setActiveTab("project")}
+            >
+              Project
+            </button>
           </div>
           <button class="close-btn" onClick={() => setOverlay(null)}>
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -457,7 +468,7 @@ export function ExportOverlay() {
             <div class="format-section">
               <span class="section-label">Format</span>
               <div class="format-options">
-                {["jpg", "png", "tif"].map((f) => (
+                {(["jpg", "png"] as const).map((f) => (
                   <button
                     class={`format-btn ${format() === f ? "active" : ""}`}
                     onClick={() => setFormat(f)}
@@ -471,12 +482,18 @@ export function ExportOverlay() {
 
           <Show when={activeTab() === "lut"}>
             <div style={{ "font-size": "11px", opacity: 0.5, "text-align": "center", padding: "20px 0" }}>
-              Export your current grade as a 33-point LUT file
+              Export the current SDR contrast curve as a 1D CUBE LUT
+            </div>
+          </Show>
+
+          <Show when={activeTab() === "project"}>
+            <div style={{ "font-size": "11px", opacity: 0.5, "text-align": "center", padding: "20px 0" }}>
+              Export project edit data without embedded source images
             </div>
           </Show>
 
           <button class="export-btn" onClick={handleExport}>
-            Export {activeTab() === "image" ? "Image" : "LUT"}
+            Export {activeTab() === "image" ? "Image" : activeTab() === "lut" ? "LUT" : "Project"}
           </button>
         </div>
       </div>
